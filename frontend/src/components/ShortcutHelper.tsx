@@ -1,11 +1,5 @@
-import React, { useState } from 'react';
-import { IoChevronDown, IoChevronUp, IoHelpCircleOutline } from 'react-icons/io5';
+import React from 'react';
 import './ShortcutHelper.css';
-
-// 图标组件包装器
-const Icon: React.FC<{ component: React.ComponentType<any> }> = ({ component: Component }) => {
-  return <Component />;
-};
 
 interface ShortcutItem {
   key: string;
@@ -13,6 +7,7 @@ interface ShortcutItem {
 }
 
 const shortcuts: ShortcutItem[] = [
+  { key: '1-9', description: '快速切换类别' },
   { key: 'R', description: '矩形框工具' },
   { key: 'P', description: '多边形工具' },
   { key: 'V', description: '选择/移动工具' },
@@ -30,29 +25,16 @@ const shortcuts: ShortcutItem[] = [
 ];
 
 export const ShortcutHelper: React.FC = () => {
-  const [isExpanded, setIsExpanded] = useState(false);
-
   return (
-    <div className={`shortcut-helper ${isExpanded ? 'expanded' : ''}`}>
-      <div
-        className="shortcut-helper-toggle"
-        onClick={() => setIsExpanded(!isExpanded)}
-      >
-        <Icon component={IoHelpCircleOutline} />
-        <span className="shortcut-helper-title">快捷键</span>
-        <Icon component={isExpanded ? IoChevronDown : IoChevronUp} />
+    <div className="shortcut-helper">
+      <div className="shortcut-helper-content">
+        {shortcuts.map((item, index) => (
+          <div key={index} className="shortcut-item">
+            <span className="shortcut-key">{item.key}</span>
+            <span className="shortcut-description">{item.description}</span>
+          </div>
+        ))}
       </div>
-      
-      {isExpanded && (
-        <div className="shortcut-helper-content">
-          {shortcuts.map((item, index) => (
-            <div key={index} className="shortcut-item">
-              <span className="shortcut-key">{item.key}</span>
-              <span className="shortcut-description">{item.description}</span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 };

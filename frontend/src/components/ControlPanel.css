@@ -1,5 +1,5 @@
 .control-panel {
-  width: 300px;
+  width: 600px;
   background: var(--bg-primary);
   border-left: 1px solid var(--border-color);
   display: flex;
@@ -8,39 +8,55 @@
   overflow: hidden;
 }
 
-.panel-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border-color);
-  background: var(--bg-primary);
-}
-
-.tab-button {
-  flex: 1;
-  padding: 12px 8px;
-  background: transparent;
-  border: none;
-  color: var(--text-light);
-  cursor: pointer;
-  font-size: 13px;
-  transition: all 0.2s;
-  border-bottom: 2px solid transparent;
-}
-
-.tab-button:hover {
-  color: var(--text-primary);
-  background: var(--bg-secondary);
-}
-
-.tab-button.active {
-  color: var(--primary-color);
-  border-bottom-color: var(--primary-color);
-  background: var(--bg-primary);
-}
-
 .panel-content {
   flex: 1;
-  overflow-y: auto;
+  display: flex;
+  overflow: hidden;
+}
+
+.panel-left-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-color);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.panel-right-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.panel-left-column .class-palette {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
   padding: 15px;
+  border-bottom: 1px solid var(--border-color);
+  overflow-y: auto;
+  max-height: 50%;
+}
+
+.panel-left-column .object-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 15px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.panel-right-column .file-navigator {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 15px;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .panel-content h3 {
@@ -149,21 +165,23 @@
 /* 类别面板 */
 .class-list {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-bottom: 20px;
 }
 
 .class-item {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px;
+  gap: 6px;
+  padding: 4px 8px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.2s;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .class-item:hover {
@@ -171,38 +189,74 @@
   background: var(--bg-secondary);
 }
 
+.class-item.selected {
+  border-color: var(--primary-color);
+  background: var(--bg-secondary);
+  border-width: 1px;
+}
+
 .class-color {
-  width: 20px;
-  height: 20px;
-  border-radius: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
   flex-shrink: 0;
   border: 1px solid var(--border-color);
 }
 
 .class-name {
-  flex: 1;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .class-shortcut {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-light);
   font-family: monospace;
   background: var(--bg-secondary);
-  padding: 2px 6px;
-  border-radius: 3px;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.class-delete-btn {
+  padding: 2px 4px;
+  background: transparent;
+  border: none;
+  border-radius: 2px;
+  cursor: pointer;
+  color: var(--text-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.class-item:hover .class-delete-btn {
+  opacity: 1;
+}
+
+.class-delete-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-secondary);
 }
 
 .create-class {
-  margin-top: 20px;
-  padding-top: 20px;
+  margin-top: 15px;
+  padding-top: 15px;
   border-top: 1px solid var(--border-color);
 }
 
 .create-class h4 {
-  font-size: 13px;
-  margin-bottom: 10px;
+  font-size: 12px;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.create-class h4 {
+  font-size: 12px;
+  margin-bottom: 8px;
   color: var(--text-primary);
 }
 

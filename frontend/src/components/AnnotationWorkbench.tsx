@@ -3,6 +3,7 @@ import { ToolsBar } from './ToolsBar';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { ControlPanel } from './ControlPanel';
 import { ShortcutHelper } from './ShortcutHelper';
+import { MQTTGuide } from './MQTTGuide';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { API_BASE_URL } from '../config';
 import { IoArrowBack, IoDownload, IoChevronDown } from 'react-icons/io5';
@@ -91,21 +92,34 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
     try {
       const response = await fetch(`${API_BASE_URL}/projects/${project.id}/images`);
       const data = await response.json();
-      setImages(data);
+      
+      setImages(prevImages => {
+        const previousLength = prevImages.length;
+        
+        // 如果有新图像添加，在控制台输出提示
+        if (data.length > previousLength) {
+          console.log(`[Image List] New image added. Total: ${data.length} (was ${previousLength})`);
+        }
+        
+        return data;
+      });
       
       // 选择逻辑：
       // 1) 初次加载或清空后，选中第一张
       // 2) 如果当前索引超出新长度（新增/删除），钳制到最后一张
+      // 3) 如果是通过 WebSocket 通知新增的图像，保持当前选中（不自动切换）
       setCurrentImageIndex(prevIndex => {
         if (data.length === 0) return -1;
         if (prevIndex === -1) return 0;
         if (prevIndex >= data.length) return data.length - 1;
+        // 如果有新图像添加（长度增加），但当前有选中图像，保持当前选中
+        // 这样用户不会因为收到新图像而被打断当前工作
         return prevIndex;
       });
     } catch (error) {
       console.error('Failed to fetch images:', error);
     }
-  }, [project.id, currentImageIndex]);
+  }, [project.id]);
 
   // 加载类别列表
   const fetchClasses = useCallback(async () => {
@@ -165,20 +179,36 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
 
   // WebSocket 连接
   useWebSocket(project.id, useCallback((message: any) => {
+    console.log('[WebSocket] Received message:', message);
+    
     if (message.type === 'new_image') {
-      // 刷新图像列表
+      console.log('[WebSocket] New image notification received:', message);
+      // 立即刷新图像列表
+      fetchImages().then(() => {
+        console.log('[WebSocket] Image list refreshed after new image notification');
+      }).catch(error => {
+        console.error('[WebSocket] Failed to refresh image list:', error);
+      });
+    } else if (message.type === 'image_status_updated') {
+      // 图像状态更新（标注创建/删除导致状态变化）
+      console.log('[WebSocket] Image status updated:', message);
+      // 刷新图像列表以更新状态显示
       fetchImages();
-      // 如果之前没有选中任何图像，等待 fetch 后会自动选中第一张
     } else if (message.type === 'annotation_deleted') {
-      // 标注被删除，刷新标注列表
+      // 标注被删除，刷新标注列表和图像列表
       const deletedImageId = message.image_id;
-      const currentImageId = images[currentImageIndex]?.id;
-      if (deletedImageId === currentImageId) {
-        // 如果删除的是当前图像的标注，刷新标注列表
-        fetchAnnotations();
-      }
+      // 刷新图像列表（状态可能从 LABELED 变为 UNLABELED）
+      fetchImages();
+      // 如果删除的是当前图像的标注，刷新标注列表
+      setImages(currentImages => {
+        const currentImageId = currentImages[currentImageIndex]?.id;
+        if (deletedImageId === currentImageId) {
+          fetchAnnotations();
+        }
+        return currentImages;
+      });
     }
-  }, [fetchImages, fetchAnnotations, images, currentImageIndex]));
+  }, [fetchImages, fetchAnnotations, currentImageIndex]));
 
   useEffect(() => {
     fetchImages();
@@ -299,6 +329,15 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
         return;
       }
 
+      // 数字键切换类别（1-9）
+      if (e.key >= '1' && e.key <= '9' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+        const keyIndex = parseInt(e.key) - 1; // 1-9 转换为 0-8
+        if (keyIndex < classes.length) {
+          e.preventDefault();
+          setSelectedClassId(classes[keyIndex].id);
+        }
+      }
+
       // 工具切换
       if (e.key === 'r' || e.key === 'R') {
         setCurrentTool('bbox');
@@ -346,7 +385,7 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
 
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
-  }, [currentImageIndex, images, selectedAnnotationId, showAnnotations, history, historyIndex, handleDeleteAnnotation, handleImageChange, handleRedo, handleUndo, saveAnnotations]);
+  }, [currentImageIndex, images, selectedAnnotationId, showAnnotations, history, historyIndex, classes, handleDeleteAnnotation, handleImageChange, handleRedo, handleUndo, saveAnnotations]);
 
   const currentImage = currentImageIndex >= 0 ? images[currentImageIndex] : null;
 
@@ -412,7 +451,6 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
 
   return (
     <div className="annotation-workbench">
-      <ShortcutHelper />
       <div className="workbench-header">
         <div className="header-left">
           <button onClick={onBack} className="btn-back">
@@ -431,6 +469,8 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
               </>
             )}
           </div>
+          
+          <MQTTGuide projectId={project.id} projectName={project.name} />
           
           <div className="export-dropdown" ref={exportMenuRef}>
             <button
@@ -473,29 +513,32 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
 
         <div className="canvas-container">
           {currentImage ? (
-            <AnnotationCanvas
-              image={currentImage}
-              annotations={annotations}
-              tool={currentTool}
-              classes={classes}
-              selectedAnnotationId={selectedAnnotationId}
-              selectedClassId={selectedClassId}
-              showAnnotations={showAnnotations}
-              onAnnotationCreate={(ann) => {
-                const newAnnotations = [...annotations, ann];
-                setAnnotations(newAnnotations);
-                addToHistory(newAnnotations);
-              }}
-              onAnnotationUpdate={(id, updates) => {
-                const newAnnotations = annotations.map(ann =>
-                  ann.id === id ? { ...ann, ...updates } : ann
-                );
-                setAnnotations(newAnnotations);
-                addToHistory(newAnnotations);
-              }}
-              onAnnotationSelect={setSelectedAnnotationId}
-              projectId={project.id}
-            />
+            <>
+              <AnnotationCanvas
+                image={currentImage}
+                annotations={annotations}
+                tool={currentTool}
+                classes={classes}
+                selectedAnnotationId={selectedAnnotationId}
+                selectedClassId={selectedClassId}
+                showAnnotations={showAnnotations}
+                onAnnotationCreate={(ann) => {
+                  const newAnnotations = [...annotations, ann];
+                  setAnnotations(newAnnotations);
+                  addToHistory(newAnnotations);
+                }}
+                onAnnotationUpdate={(id, updates) => {
+                  const newAnnotations = annotations.map(ann =>
+                    ann.id === id ? { ...ann, ...updates } : ann
+                  );
+                  setAnnotations(newAnnotations);
+                  addToHistory(newAnnotations);
+                }}
+                onAnnotationSelect={setSelectedAnnotationId}
+                projectId={project.id}
+              />
+              <ShortcutHelper />
+            </>
           ) : (
             <div className="no-image">暂无图像</div>
           )}
@@ -507,6 +550,7 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
           images={images}
           currentImageIndex={currentImageIndex}
           selectedAnnotationId={selectedAnnotationId}
+          selectedClassId={selectedClassId}
           onImageSelect={(index) => {
             saveAnnotations();
             setCurrentImageIndex(index);

@@ -1,0 +1,541 @@
+.mqtt-guide {
+  position: relative;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  transition: all 0.3s ease;
+}
+
+.mqtt-guide-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  background: transparent;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.mqtt-guide-header:hover {
+  background: var(--bg-secondary);
+}
+
+.mqtt-guide-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.mqtt-guide-header svg:first-child {
+  width: 16px;
+  height: 16px;
+  color: var(--primary-color);
+  flex-shrink: 0;
+}
+
+.mqtt-guide-header svg:last-child {
+  width: 14px;
+  height: 14px;
+  color: var(--text-light);
+  flex-shrink: 0;
+  transition: transform 0.2s;
+  margin-left: 4px;
+}
+
+.mqtt-guide.expanded .mqtt-guide-header svg:last-child {
+  transform: rotate(180deg);
+}
+
+.mqtt-guide-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.mqtt-status-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 500;
+  margin-left: 4px;
+}
+
+.mqtt-status-badge.connected {
+  background: rgba(82, 196, 26, 0.1);
+  color: #52c41a;
+}
+
+.mqtt-status-badge.disconnected {
+  background: rgba(255, 77, 79, 0.1);
+  color: var(--error-color);
+}
+
+.mqtt-status-badge svg {
+  width: 14px;
+  height: 14px;
+}
+
+.mqtt-guide-content {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  width: 450px;
+  max-width: calc(100vw - 40px);
+  padding: 16px;
+  max-height: 500px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+}
+
+.mqtt-warning {
+  padding: 12px;
+  background: rgba(255, 193, 7, 0.1);
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.mqtt-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+  background: rgba(22, 119, 255, 0.05);
+  border: 1px solid rgba(22, 119, 255, 0.2);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.mqtt-notice.success {
+  background: rgba(82, 196, 26, 0.1);
+  border: 1px solid rgba(82, 196, 26, 0.3);
+  color: #52c41a;
+}
+
+.mqtt-notice.success svg {
+  color: #52c41a;
+}
+
+.broker-type-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.broker-type-badge.builtin {
+  background: rgba(82, 196, 26, 0.1);
+  color: #52c41a;
+}
+
+.broker-type-badge.external {
+  background: rgba(22, 119, 255, 0.1);
+  color: var(--primary-color);
+}
+
+.mqtt-notice svg {
+  width: 16px;
+  height: 16px;
+  color: var(--primary-color);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.mqtt-notice p {
+  margin: 0;
+  flex: 1;
+}
+
+.mqtt-notice strong {
+  color: var(--primary-color);
+  font-weight: 600;
+}
+
+.mqtt-info-section,
+.mqtt-usage-section,
+.mqtt-example-section,
+.mqtt-fields-section,
+.mqtt-response-section {
+  margin-bottom: 16px;
+}
+
+.mqtt-info-section:last-child,
+.mqtt-usage-section:last-child,
+.mqtt-example-section:last-child,
+.mqtt-fields-section:last-child,
+.mqtt-response-section:last-child {
+  margin-bottom: 0;
+}
+
+.mqtt-guide-content h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary-color);
+  margin: 0 0 10px 0;
+}
+
+.info-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.info-item:last-child {
+  margin-bottom: 0;
+}
+
+.mqtt-test-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.btn-test-mqtt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--primary-color);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-white);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.2s;
+  width: 100%;
+  justify-content: center;
+}
+
+.btn-test-mqtt:hover:not(:disabled) {
+  background: var(--primary-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(10, 13, 22, 0.3);
+}
+
+.btn-test-mqtt:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-test-mqtt svg {
+  width: 14px;
+  height: 14px;
+}
+
+.test-result {
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.test-result.success {
+  background: rgba(82, 196, 26, 0.1);
+  border: 1px solid rgba(82, 196, 26, 0.3);
+  color: #52c41a;
+}
+
+.test-result.error {
+  background: rgba(255, 77, 79, 0.1);
+  border: 1px solid rgba(255, 77, 79, 0.3);
+  color: var(--error-color);
+}
+
+.test-result-message {
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.test-result-suggestions {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 77, 79, 0.2);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+.test-result-suggestions strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+}
+
+.test-result-suggestions ul {
+  margin: 6px 0 0 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+}
+
+.test-result-suggestions li {
+  margin-bottom: 4px;
+}
+
+.test-result-detail {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(255, 77, 79, 0.05);
+  border-left: 3px solid var(--error-color);
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.suggestion-steps {
+  margin-top: 8px;
+}
+
+.suggestion-steps p {
+  margin: 8px 0 8px 0;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.code-snippet {
+  margin: 8px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.code-snippet-header {
+  padding: 6px 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.code-snippet pre {
+  margin: 0;
+  padding: 10px;
+  background: #f8f8f8;
+  overflow-x: auto;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.code-snippet code {
+  font-family: 'Courier New', monospace;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+.info-label {
+  color: var(--text-secondary);
+  min-width: 100px;
+  flex-shrink: 0;
+}
+
+.info-value-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  position: relative;
+}
+
+.info-value {
+  background: var(--bg-secondary);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  word-break: break-all;
+  flex: 1;
+}
+
+.btn-copy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-light);
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.btn-copy:hover {
+  background: var(--bg-secondary);
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+
+.btn-copy svg {
+  width: 14px;
+  height: 14px;
+}
+
+.copied-tooltip {
+  position: absolute;
+  top: -28px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--primary-color);
+  color: var(--text-white);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 1000;
+}
+
+.copied-tooltip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: var(--primary-color);
+}
+
+.usage-steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.usage-steps li {
+  margin-bottom: 8px;
+}
+
+.usage-steps code {
+  background: var(--bg-secondary);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  color: var(--primary-color);
+}
+
+.code-block-container {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.code-block {
+  margin: 0;
+  padding: 10px;
+  background: #f8f8f8;
+  overflow-x: auto;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.code-block code {
+  font-family: 'Courier New', monospace;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+.fields-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.fields-table thead {
+  background: var(--bg-secondary);
+}
+
+.fields-table th {
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-bottom: 2px solid var(--border-color);
+}
+
+.fields-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.fields-table td:first-child {
+  font-family: 'Courier New', monospace;
+  color: var(--primary-color);
+  font-weight: 500;
+}
+
+.fields-table tbody tr:hover {
+  background: var(--bg-secondary);
+}
+
+.response-list {
+  margin: 8px 0 0 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.response-list code {
+  background: var(--bg-secondary);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  color: var(--primary-color);
+}
+
+/* 滚动条样式 */
+.mqtt-guide-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.mqtt-guide-content::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+  border-radius: 3px;
+}
+
+.mqtt-guide-content::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.mqtt-guide-content::-webkit-scrollbar-thumb:hover {
+  background: var(--text-light);
+}

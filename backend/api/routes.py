@@ -13,6 +13,7 @@ import shutil
 
 from backend.models.database import get_db, Project, Image, Class, Annotation
 from backend.services.websocket_manager import websocket_manager
+from backend.services.mqtt_service import mqtt_service
 from backend.utils.yolo_export import YOLOExporter
 from backend.config import settings
 from PIL import Image as PILImage
@@ -154,6 +155,31 @@ def list_classes(project_id: str, db: Session = Depends(get_db)):
     """列出项目所有类别"""
     classes = db.query(Class).filter(Class.project_id == project_id).all()
     return classes
+
+
+@router.delete("/projects/{project_id}/classes/{class_id}")
+def delete_class(project_id: str, class_id: int, db: Session = Depends(get_db)):
+    """删除类别"""
+    db_class = db.query(Class).filter(
+        Class.id == class_id,
+        Class.project_id == project_id
+    ).first()
+    
+    if not db_class:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # 检查是否有标注使用此类别
+    annotation_count = db.query(Annotation).filter(Annotation.class_id == class_id).count()
+    if annotation_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete class: {annotation_count} annotation(s) are using this class"
+        )
+    
+    db.delete(db_class)
+    db.commit()
+    
+    return {"message": "Class deleted"}
 
 
 # ========== 图像相关 ==========
@@ -373,6 +399,8 @@ def create_annotation(image_id: int, annotation: AnnotationCreate, db: Session =
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
     
+    project_id = image.project_id
+    
     db_annotation = Annotation(
         image_id=image_id,
         class_id=annotation.class_id,
@@ -383,10 +411,19 @@ def create_annotation(image_id: int, annotation: AnnotationCreate, db: Session =
     db.add(db_annotation)
     
     # 更新图像状态
+    was_unlabeled = image.status == "UNLABELED"
     image.status = "LABELED"
     
     db.commit()
     db.refresh(db_annotation)
+    
+    # 如果状态从 UNLABELED 变为 LABELED，通知前端更新图像列表
+    if was_unlabeled:
+        websocket_manager.broadcast_project_update(project_id, {
+            "type": "image_status_updated",
+            "image_id": image_id,
+            "status": "LABELED"
+        })
     
     return db_annotation
 
@@ -398,11 +435,24 @@ def update_annotation(annotation_id: int, annotation: AnnotationUpdate, db: Sess
     if not db_ann:
         raise HTTPException(status_code=404, detail="Annotation not found")
     
+    image = db.query(Image).filter(Image.id == db_ann.image_id).first()
+    project_id = image.project_id if image else None
+    
     if annotation.data is not None:
         db_ann.data = json.dumps(annotation.data)
     
     if annotation.class_id is not None:
         db_ann.class_id = annotation.class_id
+    
+    # 确保图像状态为 LABELED（如果之前不是）
+    if image and image.status != "LABELED":
+        image.status = "LABELED"
+        if project_id:
+            websocket_manager.broadcast_project_update(project_id, {
+                "type": "image_status_updated",
+                "image_id": db_ann.image_id,
+                "status": "LABELED"
+            })
     
     db.commit()
     db.refresh(db_ann)
@@ -425,13 +475,15 @@ def delete_annotation(annotation_id: int, db: Session = Depends(get_db)):
     
     # 检查是否还有标注，如果没有则更新状态
     remaining = db.query(Annotation).filter(Annotation.image_id == image_id).count()
+    status_changed = False
     if remaining == 0:
-        if image:
+        if image and image.status == "LABELED":
             image.status = "UNLABELED"
+            status_changed = True
     
     db.commit()
     
-    # 通过 WebSocket 通知前端标注已删除
+    # 通过 WebSocket 通知前端
     if project_id:
         from backend.services.websocket_manager import websocket_manager
         websocket_manager.broadcast_project_update(project_id, {
@@ -439,6 +491,14 @@ def delete_annotation(annotation_id: int, db: Session = Depends(get_db)):
             "annotation_id": annotation_id,
             "image_id": image_id
         })
+        
+        # 如果状态改变，也通知图像状态更新
+        if status_changed:
+            websocket_manager.broadcast_project_update(project_id, {
+                "type": "image_status_updated",
+                "image_id": image_id,
+                "status": "UNLABELED"
+            })
     
     return {"message": "Annotation deleted"}
 
@@ -658,4 +718,181 @@ def export_dataset_zip(project_id: str, db: Session = Depends(get_db)):
             "Content-Disposition": f"attachment; filename={project.name}_dataset.zip"
         }
     )
+
+
+# ========== MQTT 服务管理 ==========
+
+@router.get("/mqtt/status")
+def get_mqtt_status():
+    """获取 MQTT 服务状态"""
+    from backend.config import get_local_ip
+    
+    if settings.MQTT_USE_BUILTIN_BROKER:
+        broker = get_local_ip()
+        port = settings.MQTT_BUILTIN_PORT
+        broker_type = "builtin"
+    else:
+        broker = settings.MQTT_BROKER
+        port = settings.MQTT_PORT
+        broker_type = "external"
+    
+    return {
+        "enabled": settings.MQTT_ENABLED,
+        "use_builtin": settings.MQTT_USE_BUILTIN_BROKER if settings.MQTT_ENABLED else False,
+        "broker_type": broker_type if settings.MQTT_ENABLED else None,
+        "connected": mqtt_service.is_connected if settings.MQTT_ENABLED else False,
+        "broker": broker if settings.MQTT_ENABLED else None,
+        "port": port if settings.MQTT_ENABLED else None,
+        "topic": settings.MQTT_UPLOAD_TOPIC if settings.MQTT_ENABLED else None
+    }
+
+
+@router.post("/mqtt/test")
+def test_mqtt_connection():
+    """测试 MQTT 连接"""
+    if not settings.MQTT_ENABLED:
+        return {
+            "success": False,
+            "message": "MQTT 服务已禁用",
+            "error": "MQTT_ENABLED is False"
+        }
+    
+    import socket
+    import time
+    
+    try:
+        from backend.config import get_local_ip
+        
+        # 确定要测试的 Broker 地址
+        if settings.MQTT_USE_BUILTIN_BROKER:
+            broker_host = get_local_ip()
+            broker_port = settings.MQTT_BUILTIN_PORT
+        else:
+            broker_host = settings.MQTT_BROKER
+            broker_port = settings.MQTT_PORT
+        
+        # 测试 TCP 连接
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((broker_host, broker_port))
+        sock.close()
+        
+        if result == 0:
+            # TCP 连接成功，尝试 MQTT 连接
+            import paho.mqtt.client as mqtt
+            import uuid
+            
+            test_client = None
+            connection_result = {"success": False, "message": ""}
+            
+            def on_connect_test(client, userdata, flags, rc):
+                connection_result["success"] = (rc == 0)
+                if rc == 0:
+                    connection_result["message"] = "MQTT 连接成功"
+                else:
+                    connection_result["message"] = f"MQTT 连接失败，错误代码: {rc}"
+                client.disconnect()
+            
+            def on_connect_fail_test(client, userdata):
+                connection_result["success"] = False
+                connection_result["message"] = "MQTT 连接超时"
+            
+            try:
+                # 明确指定使用 MQTT 3.1.1 协议（aMQTT broker 不支持 MQTT 5.0）
+                test_client = mqtt.Client(
+                    client_id=f"test_client_{uuid.uuid4().hex[:8]}",
+                    protocol=mqtt.MQTTv311
+                )
+                test_client.on_connect = on_connect_test
+                test_client.on_connect_fail = on_connect_fail_test
+                
+                # 内置 Broker 不需要认证，外部 Broker 才需要
+                if not settings.MQTT_USE_BUILTIN_BROKER:
+                    if settings.MQTT_USERNAME and settings.MQTT_PASSWORD:
+                        test_client.username_pw_set(settings.MQTT_USERNAME, settings.MQTT_PASSWORD)
+                
+                test_client.connect(broker_host, broker_port, keepalive=5)
+                test_client.loop_start()
+                
+                # 等待连接结果（最多等待 3 秒）
+                timeout = 3
+                elapsed = 0
+                while elapsed < timeout and connection_result["message"] == "":
+                    time.sleep(0.1)
+                    elapsed += 0.1
+                
+                test_client.loop_stop()
+                test_client.disconnect()
+                
+                if connection_result["message"] == "":
+                    connection_result["message"] = "连接超时"
+                
+                return {
+                    "success": connection_result["success"],
+                    "message": connection_result["message"],
+                    "broker": f"{broker_host}:{broker_port}",
+                    "broker_type": "builtin" if settings.MQTT_USE_BUILTIN_BROKER else "external",
+                    "tcp_connected": True
+                }
+            except Exception as e:
+                if test_client:
+                    try:
+                        test_client.loop_stop()
+                        test_client.disconnect()
+                    except:
+                        pass
+                return {
+                    "success": False,
+                    "message": f"MQTT 连接测试失败: {str(e)}",
+                    "broker": f"{broker_host}:{broker_port}",
+                    "broker_type": "builtin" if settings.MQTT_USE_BUILTIN_BROKER else "external",
+                    "tcp_connected": True
+                }
+        else:
+            error_msg = f"无法连接到 MQTT Broker ({broker_host}:{broker_port})"
+            error_detail = ""
+            
+            # macOS/Linux 错误代码
+            if result == 61 or result == 111:  # ECONNREFUSED (macOS: 61, Linux: 111)
+                error_msg += " - 连接被拒绝"
+                error_detail = "MQTT Broker 可能未运行。请启动 MQTT Broker 服务。"
+            elif result == 60 or result == 110:  # ETIMEDOUT (macOS: 60, Linux: 110)
+                error_msg += " - 连接超时"
+                error_detail = "网络连接超时，请检查网络和防火墙设置。"
+            elif result == 64 or result == 113:  # EHOSTUNREACH (macOS: 64, Linux: 113)
+                error_msg += " - 无法到达主机"
+                error_detail = "无法到达 MQTT Broker 地址，请检查 Broker 地址配置。"
+            elif result == 51:  # ENETUNREACH (macOS)
+                error_msg += " - 网络不可达"
+                error_detail = "网络不可达，请检查网络连接和 Broker 地址。"
+            else:
+                error_msg += f" - 错误代码: {result}"
+                error_detail = "请检查 MQTT Broker 配置和运行状态。"
+            
+            return {
+                "success": False,
+                "message": error_msg,
+                "detail": error_detail,
+                "broker": f"{broker_host}:{broker_port}",
+                "broker_type": "builtin" if settings.MQTT_USE_BUILTIN_BROKER else "external",
+                "tcp_connected": False,
+                "error": "TCP connection failed",
+                "error_code": result
+            }
+    except socket.gaierror as e:
+        return {
+            "success": False,
+            "message": f"无法解析 MQTT Broker 地址: {str(e)}",
+            "broker": f"{settings.MQTT_BROKER}:{settings.MQTT_PORT}",
+            "tcp_connected": False,
+            "error": "DNS resolution failed"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"连接测试失败: {str(e)}",
+            "broker": f"{settings.MQTT_BROKER}:{settings.MQTT_PORT}",
+            "tcp_connected": False,
+            "error": str(e)
+        }
 

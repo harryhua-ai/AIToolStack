@@ -15,6 +15,7 @@ interface ControlPanelProps {
   images: ImageInfo[];
   currentImageIndex: number;
   selectedAnnotationId: number | null;
+  selectedClassId: number | null;
   onImageSelect: (index: number) => void;
   onAnnotationSelect: (id: number | null) => void;
   onAnnotationVisibilityChange: (id: number, visible: boolean) => void;
@@ -32,6 +33,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   images,
   currentImageIndex,
   selectedAnnotationId,
+  selectedClassId,
   onImageSelect,
   onAnnotationSelect,
   onAnnotationVisibilityChange,
@@ -42,12 +44,60 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onImageUpload,
   onImageDelete
 }) => {
-  const [activeTab, setActiveTab] = useState<'objects' | 'classes' | 'files'>('classes');
   const [newClassName, setNewClassName] = useState('');
   const [newClassColor, setNewClassColor] = useState('#4a9eff');
   const [isUploading, setIsUploading] = useState(false);
   const [isDeleting, setIsDeleting] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 生成随机颜色（100种颜色）
+  const generateRandomColor = (): string => {
+    const colors = [
+      // 红色系
+      '#FF6B6B', '#E74C3C', '#C0392B', '#FF4757', '#FF3838',
+      '#FF6348', '#FF5733', '#FF4444', '#FF1744', '#D32F2F',
+      // 橙色系
+      '#FFA07A', '#F39C12', '#E67E22', '#D35400', '#FF8C00',
+      '#FF7F50', '#FF6B35', '#FF8C42', '#FF9500', '#FF6F00',
+      // 黄色系
+      '#F7DC6F', '#F1C40F', '#F39C12', '#FFD700', '#FFC107',
+      '#FFEB3B', '#FFD54F', '#FFCA28', '#FFC300', '#FFD700',
+      // 绿色系
+      '#52BE80', '#1ABC9C', '#16A085', '#27AE60', '#2ECC71',
+      '#4CAF50', '#8BC34A', '#66BB6A', '#81C784', '#A5D6A7',
+      // 青色/蓝绿色系
+      '#4ECDC4', '#45B7D1', '#1ABC9C', '#16A085', '#00BCD4',
+      '#00ACC1', '#0097A7', '#00838F', '#26C6DA', '#4DD0E1',
+      // 蓝色系
+      '#3498DB', '#2980B9', '#45B7D1', '#5DADE2', '#85C1E2',
+      '#2196F3', '#1976D2', '#0D47A1', '#42A5F5', '#64B5F6',
+      // 紫色系
+      '#9B59B6', '#8E44AD', '#BB8FCE', '#7B1FA2', '#6A1B9A',
+      '#9C27B0', '#8E24AA', '#AB47BC', '#BA68C8', '#CE93D8',
+      // 粉色系
+      '#E91E63', '#C2185B', '#F06292', '#EC407A', '#F48FB1',
+      '#F8BBD0', '#FF4081', '#E91E63', '#AD1457', '#880E4F',
+      // 棕色系
+      '#8D6E63', '#6D4C41', '#5D4037', '#795548', '#A1887F',
+      '#BCAAA4', '#D7CCC8', '#8B4513', '#A0522D', '#CD853F',
+      // 灰色系
+      '#7F8C8D', '#34495E', '#2C3E50', '#95A5A6', '#BDC3C7',
+      '#78909C', '#607D8B', '#546E7A', '#455A64', '#37474F',
+      // 深色系
+      '#2C3E50', '#34495E', '#1A1A1A', '#212121', '#263238',
+      '#37474F', '#455A64', '#546E7A', '#607D8B', '#78909C',
+      // 亮色系
+      '#F5F5F5', '#FAFAFA', '#FFFFFF', '#E0E0E0', '#BDBDBD',
+      '#9E9E9E', '#757575', '#616161', '#424242', '#212121',
+      // 特殊色系
+      '#00E676', '#00C853', '#76FF03', '#C6FF00', '#FFEA00',
+      '#FFC400', '#FF9100', '#FF3D00', '#D50000', '#C51162',
+      '#AA00FF', '#6200EA', '#304FFE', '#2962FF', '#0091EA',
+      '#00B8D4', '#00BFA5', '#00C853', '#64DD17', '#AEEA00',
+      '#FFD600', '#FFAB00', '#FF6D00', '#DD2C00', '#D50000'
+    ];
+    return colors[Math.floor(Math.random() * colors.length)];
+  };
 
   const handleDeleteImage = async (imageId: number, event: React.MouseEvent) => {
     event.stopPropagation(); // 阻止触发图片选择
@@ -153,6 +203,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
 
       if (response.ok) {
         setNewClassName('');
+        setNewClassColor(generateRandomColor()); // 重置为随机颜色
         onCreateClass();
       } else {
         alert('创建类别失败');
@@ -163,31 +214,103 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
     }
   };
 
+  const handleDeleteClass = async (classId: number, event: React.MouseEvent) => {
+    event.stopPropagation(); // 阻止触发类别选择
+    
+    const classToDelete = classes.find(c => c.id === classId);
+    if (!classToDelete) return;
+    
+    if (!window.confirm(`确定要删除类别"${classToDelete.name}"吗？如果该类别已被使用，将无法删除。`)) {
+      return;
+    }
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/projects/${projectId}/classes/${classId}`, {
+        method: 'DELETE'
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || '删除失败');
+      }
+      
+      onCreateClass(); // 刷新类别列表
+    } catch (error: any) {
+      alert(`删除类别失败: ${error.message}`);
+    }
+  };
+
   return (
     <div className="control-panel">
-      <div className="panel-tabs">
-        <button
-          className={`tab-button ${activeTab === 'objects' ? 'active' : ''}`}
-          onClick={() => setActiveTab('objects')}
-        >
-          标注列表
-        </button>
-        <button
-          className={`tab-button ${activeTab === 'classes' ? 'active' : ''}`}
-          onClick={() => setActiveTab('classes')}
-        >
-          类别
-        </button>
-        <button
-          className={`tab-button ${activeTab === 'files' ? 'active' : ''}`}
-          onClick={() => setActiveTab('files')}
-        >
-          文件
-        </button>
-      </div>
-
       <div className="panel-content">
-        {activeTab === 'objects' && (
+        {/* 左列：类别管理和标注列表 */}
+        <div className="panel-left-column">
+          {/* 类别管理 */}
+          <div className="class-palette">
+            <h3>标注类别 ({classes.length})</h3>
+            {classes.length === 0 ? (
+              <div className="empty-state">请创建一个类别</div>
+            ) : (
+              <div className="class-list">
+                {classes.map((cls, index) => {
+                  // 自动为前9个类别分配快捷键（如果没有设置）
+                  const shortcutKey = cls.shortcutKey || (index < 9 ? String(index + 1) : null);
+                  return (
+                    <div
+                      key={cls.id}
+                      className={`class-item ${selectedClassId === cls.id ? 'selected' : ''}`}
+                      onClick={() => onClassSelect(cls.id)}
+                    >
+                      <div
+                        className="class-color"
+                        style={{ backgroundColor: cls.color }}
+                      />
+                      <span className="class-name">{cls.name}</span>
+                      {shortcutKey && (
+                        <span className="class-shortcut">{shortcutKey}</span>
+                      )}
+                      <button
+                        className="class-delete-btn"
+                        onClick={(e) => handleDeleteClass(cls.id, e)}
+                        title="删除类别"
+                      >
+                        <Icon component={IoTrash} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="create-class">
+              <h4>创建新类别</h4>
+              <input
+                type="text"
+                placeholder="类别名称"
+                value={newClassName}
+                onChange={(e) => setNewClassName(e.target.value)}
+                className="class-input"
+              />
+              <div className="color-input-group">
+                <input
+                  type="color"
+                  value={newClassColor}
+                  onChange={(e) => setNewClassColor(e.target.value)}
+                  className="color-picker"
+                />
+                <input
+                  type="text"
+                  value={newClassColor}
+                  onChange={(e) => setNewClassColor(e.target.value)}
+                  className="color-text"
+                />
+              </div>
+              <button onClick={handleCreateClass} className="btn-create-class">
+                创建
+              </button>
+            </div>
+          </div>
+
+          {/* 标注列表 */}
           <div className="object-list">
             <h3>标注列表 ({annotations.length})</h3>
             {annotations.length === 0 ? (
@@ -234,64 +357,10 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
               </div>
             )}
           </div>
-        )}
+        </div>
 
-        {activeTab === 'classes' && (
-          <div className="class-palette">
-            <h3>类别 ({classes.length})</h3>
-            {classes.length === 0 ? (
-              <div className="empty-state">请创建一个类别</div>
-            ) : (
-              <div className="class-list">
-                {classes.map((cls) => (
-                  <div
-                    key={cls.id}
-                    className="class-item"
-                    onClick={() => onClassSelect(cls.id)}
-                  >
-                    <div
-                      className="class-color"
-                      style={{ backgroundColor: cls.color }}
-                    />
-                    <span className="class-name">{cls.name}</span>
-                    {cls.shortcutKey && (
-                      <span className="class-shortcut">{cls.shortcutKey}</span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="create-class">
-              <h4>创建新类别</h4>
-              <input
-                type="text"
-                placeholder="类别名称"
-                value={newClassName}
-                onChange={(e) => setNewClassName(e.target.value)}
-                className="class-input"
-              />
-              <div className="color-input-group">
-                <input
-                  type="color"
-                  value={newClassColor}
-                  onChange={(e) => setNewClassColor(e.target.value)}
-                  className="color-picker"
-                />
-                <input
-                  type="text"
-                  value={newClassColor}
-                  onChange={(e) => setNewClassColor(e.target.value)}
-                  className="color-text"
-                />
-              </div>
-              <button onClick={handleCreateClass} className="btn-create-class">
-                创建
-              </button>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'files' && (
+        {/* 右列：图像文件 */}
+        <div className="panel-right-column">
           <div className="file-navigator">
             <div className="file-header">
               <h3>图像列表 ({images.length})</h3>
@@ -346,7 +415,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
               })}
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );

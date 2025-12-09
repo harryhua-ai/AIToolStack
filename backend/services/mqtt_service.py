@@ -6,12 +6,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import paho.mqtt.client as mqtt
-from PIL import Image
+from PIL import Image as PILImage
 import io
 
 from backend.config import settings
 from backend.models.database import SessionLocal, Image, Project
 from backend.services.websocket_manager import websocket_manager
+from backend.services.mqtt_broker import builtin_mqtt_broker
 
 
 class MQTTService:
@@ -69,11 +70,49 @@ class MQTTService:
     
     def _handle_image_upload(self, project_id: str, data: dict, topic: str):
         """处理图像上传"""
-        req_id = data.get('req_id', str(uuid.uuid4()))
-        device_id = data.get('device_id', 'unknown')
-        timestamp = data.get('timestamp', int(datetime.utcnow().timestamp()))
-        image_data = data.get('image', {})
-        metadata = data.get('metadata', {})
+        # 适配新的数据结构
+        # 支持两种格式：
+        # 1. 新格式: { "image_data": "...", "encoding": "...", "metadata": {...} }
+        # 2. 旧格式: { "req_id": "...", "device_id": "...", "image": {...} }
+        
+        # 尝试新格式
+        if 'image_data' in data:
+            # 新格式
+            req_id = data.get('req_id', str(uuid.uuid4()))
+            device_id = data.get('device_id', topic.split('/')[-1] if '/' in topic else 'unknown')
+            metadata = data.get('metadata', {})
+            encoding = data.get('encoding', 'base64')
+            base64_data = data.get('image_data', '')
+            
+            # 从 metadata 中提取信息
+            image_id = metadata.get('image_id', f'img_{int(datetime.utcnow().timestamp())}')
+            timestamp = metadata.get('timestamp', int(datetime.utcnow().timestamp()))
+            image_format = metadata.get('format', 'jpeg').lower()
+            # 如果 metadata 中有尺寸信息，优先使用
+            metadata_width = metadata.get('width')
+            metadata_height = metadata.get('height')
+            
+            # 生成文件名
+            if image_format in ['jpeg', 'jpg']:
+                filename = f'{image_id}.jpg'
+            elif image_format == 'png':
+                filename = f'{image_id}.png'
+            else:
+                filename = f'{image_id}.{image_format}'
+        else:
+            # 旧格式（向后兼容）
+            req_id = data.get('req_id', str(uuid.uuid4()))
+            device_id = data.get('device_id', 'unknown')
+            timestamp = data.get('timestamp', int(datetime.utcnow().timestamp()))
+            image_data = data.get('image', {})
+            metadata = data.get('metadata', {})
+            
+            filename = image_data.get('filename', f'img_{timestamp}.jpg')
+            image_format = image_data.get('format', 'jpg').lower()
+            encoding = image_data.get('encoding', 'base64')
+            base64_data = image_data.get('data', '')
+            metadata_width = None
+            metadata_height = None
         
         # 校验项目是否存在
         db = SessionLocal()
@@ -85,30 +124,49 @@ class MQTTService:
                 self._send_error_response(req_id, device_id, error_msg)
                 return
             
-            # 解析图像数据
-            filename = image_data.get('filename', f'img_{timestamp}.jpg')
-            image_format = image_data.get('format', 'jpg').lower()
-            encoding = image_data.get('encoding', 'base64')
-            base64_data = image_data.get('data', '')
-            
-            # 移除可能的 data:image/jpg;base64, 前缀
-            if ',' in base64_data:
+            # 处理 base64 数据，移除可能的 data URI 前缀
+            # 支持格式：
+            # 1. data:image/jpeg;base64,xxxxx
+            # 2. data:image/png;base64,xxxxx
+            # 3. data:image/jpg;base64,xxxxx
+            # 4. 纯 base64 字符串
+            if base64_data.startswith('data:'):
+                # 包含 data URI 前缀，提取 base64 部分
+                if ',' in base64_data:
+                    base64_data = base64_data.split(',')[-1]
+                else:
+                    # 如果格式异常，尝试移除 data: 前缀
+                    base64_data = base64_data.replace('data:', '').split(';')[-1]
+            elif ',' in base64_data:
+                # 可能包含其他分隔符
                 base64_data = base64_data.split(',')[-1]
+            
+            # 清理可能的空白字符
+            base64_data = base64_data.strip()
             
             # Base64 解码
             if encoding != 'base64':
                 raise ValueError(f"Unsupported encoding: {encoding}")
             
-            image_bytes = base64.b64decode(base64_data)
+            try:
+                image_bytes = base64.b64decode(base64_data)
+            except Exception as e:
+                raise ValueError(f"Failed to decode base64 data: {str(e)}")
             
             # 校验图像大小
             size_mb = len(image_bytes) / (1024 * 1024)
             if size_mb > settings.MAX_IMAGE_SIZE_MB:
                 raise ValueError(f"Image too large: {size_mb:.2f}MB (max: {settings.MAX_IMAGE_SIZE_MB}MB)")
             
-            # 打开图像获取尺寸
-            img = Image.open(io.BytesIO(image_bytes))
-            img_width, img_height = img.size
+            # 获取图像尺寸
+            if metadata_width and metadata_height:
+                # 使用 metadata 中的尺寸信息
+                img_width = metadata_width
+                img_height = metadata_height
+            else:
+                # 打开图像获取尺寸
+                img = PILImage.open(io.BytesIO(image_bytes))
+                img_width, img_height = img.size
             
             # 生成存储路径
             project_dir = settings.DATASETS_ROOT / project_id / "raw"
@@ -200,23 +258,50 @@ class MQTTService:
     
     def start(self):
         """启动 MQTT 客户端"""
-        self.client = mqtt.Client(client_id=f"annotator_server_{uuid.uuid4().hex[:8]}")
+        if not settings.MQTT_ENABLED:
+            print("[MQTT] MQTT service is disabled in configuration")
+            return
         
-        # 设置回调
-        self.client.on_connect = self.on_connect
-        self.client.on_disconnect = self.on_disconnect
-        self.client.on_message = self.on_message
-        
-        # 设置认证（如果需要）
-        if settings.MQTT_USERNAME and settings.MQTT_PASSWORD:
-            self.client.username_pw_set(settings.MQTT_USERNAME, settings.MQTT_PASSWORD)
-        
-        # 连接到 Broker
         try:
-            self.client.connect(settings.MQTT_BROKER, settings.MQTT_PORT, keepalive=60)
+            # 明确指定使用 MQTT 3.1.1 协议（aMQTT broker 不支持 MQTT 5.0）
+            # protocol=mqtt.MQTTv311 表示使用 MQTT 3.1.1
+            self.client = mqtt.Client(
+                client_id=f"annotator_server_{uuid.uuid4().hex[:8]}",
+                protocol=mqtt.MQTTv311
+            )
+            
+            # 设置回调
+            self.client.on_connect = self.on_connect
+            self.client.on_disconnect = self.on_disconnect
+            self.client.on_message = self.on_message
+            
+            # 确定要连接的 Broker 地址
+            if settings.MQTT_USE_BUILTIN_BROKER:
+                # 内置 Broker 绑定在 0.0.0.0，但客户端连接时使用本机 IP
+                from backend.config import get_local_ip
+                broker_host = get_local_ip()
+                broker_port = settings.MQTT_BUILTIN_PORT
+                print(f"[MQTT] Using built-in MQTT Broker at {broker_host}:{broker_port}")
+            else:
+                broker_host = settings.MQTT_BROKER
+                broker_port = settings.MQTT_PORT
+                print(f"[MQTT] Connecting to external MQTT Broker at {broker_host}:{broker_port}")
+                # 外部 Broker 才需要认证
+                if settings.MQTT_USERNAME and settings.MQTT_PASSWORD:
+                    self.client.username_pw_set(settings.MQTT_USERNAME, settings.MQTT_PASSWORD)
+            
+            # 连接到 Broker
+            self.client.connect(broker_host, broker_port, keepalive=60)
             self.client.loop_start()
+        except ConnectionRefusedError:
+            if settings.MQTT_USE_BUILTIN_BROKER:
+                print(f"[MQTT] Connection refused. Built-in broker may not be running.")
+            else:
+                print(f"[MQTT] Connection refused. Please check if MQTT broker is running at {settings.MQTT_BROKER}:{settings.MQTT_PORT}")
+            self.is_connected = False
         except Exception as e:
             print(f"[MQTT] Failed to connect: {e}")
+            self.is_connected = False
     
     def stop(self):
         """停止 MQTT 客户端"""

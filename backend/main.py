@@ -6,6 +6,7 @@ from backend.config import settings
 from backend.models.database import init_db
 from backend.api import routes
 from backend.services.mqtt_service import mqtt_service
+from backend.services.mqtt_broker import builtin_mqtt_broker
 from backend.services.websocket_manager import websocket_manager
 
 # 创建 FastAPI 应用
@@ -51,9 +52,27 @@ async def startup_event():
     init_db()
     print("[Server] Database initialized")
     
-    # 启动 MQTT 服务
-    mqtt_service.start()
-    print("[Server] MQTT service started")
+    # 启动 MQTT 服务（如果启用）
+    if settings.MQTT_ENABLED:
+        # 如果使用内置 Broker，先启动内置 Broker
+        if settings.MQTT_USE_BUILTIN_BROKER:
+            try:
+                builtin_mqtt_broker.start()
+                print(f"[Server] Built-in MQTT Broker started on port {settings.MQTT_BUILTIN_PORT}")
+            except Exception as e:
+                print(f"[Server] Failed to start built-in MQTT Broker: {e}")
+                print("[Server] Continuing without built-in broker...")
+                print("[Server] You can set MQTT_USE_BUILTIN_BROKER=False to use external broker")
+        
+        # 启动 MQTT 客户端服务
+        try:
+            mqtt_service.start()
+            print("[Server] MQTT service started")
+        except Exception as e:
+            print(f"[Server] Failed to start MQTT service: {e}")
+            print("[Server] Continuing without MQTT service...")
+    else:
+        print("[Server] MQTT service is disabled")
 
 
 @app.on_event("shutdown")
@@ -62,6 +81,14 @@ async def shutdown_event():
     print("[Server] Shutting down...")
     mqtt_service.stop()
     print("[Server] MQTT service stopped")
+    
+    # 停止内置 Broker
+    if settings.MQTT_ENABLED and settings.MQTT_USE_BUILTIN_BROKER:
+        try:
+            builtin_mqtt_broker.stop()
+            print("[Server] Built-in MQTT Broker stopped")
+        except Exception as e:
+            print(f"[Server] Error stopping built-in broker: {e}")
 
 
 @app.get("/")
@@ -79,7 +106,8 @@ def health_check():
     """健康检查"""
     return {
         "status": "healthy",
-        "mqtt_connected": mqtt_service.is_connected
+        "mqtt_enabled": settings.MQTT_ENABLED,
+        "mqtt_connected": mqtt_service.is_connected if settings.MQTT_ENABLED else False
     }
 
 
