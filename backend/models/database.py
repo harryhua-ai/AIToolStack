@@ -86,6 +86,41 @@ class Annotation(Base):
     class_ = relationship("Class", back_populates="annotations")
 
 
+class TrainingRecord(Base):
+    """训练记录表"""
+    __tablename__ = "training_records"
+
+    training_id = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)
+    status = Column(String, default="running")
+    start_time = Column(DateTime, default=datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    model_size = Column(String, nullable=True)
+    epochs = Column(Integer, nullable=True)
+    imgsz = Column(Integer, nullable=True)
+    batch = Column(Integer, nullable=True)
+    device = Column(String, nullable=True)
+    metrics = Column(Text, nullable=True)  # JSON 字符串
+    error = Column(Text, nullable=True)
+    model_path = Column(Text, nullable=True)
+    log_count = Column(Integer, default=0)
+
+    project = relationship("Project")
+
+
+class TrainingLog(Base):
+    """训练日志表"""
+    __tablename__ = "training_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    training_id = Column(String, ForeignKey("training_records.training_id"), index=True, nullable=False)
+    project_id = Column(String, ForeignKey("projects.id"), index=True, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    message = Column(Text, nullable=False)
+
+    training_record = relationship("TrainingRecord")
+
+
 def init_db():
     """初始化数据库，创建所有表"""
     Base.metadata.create_all(bind=engine)

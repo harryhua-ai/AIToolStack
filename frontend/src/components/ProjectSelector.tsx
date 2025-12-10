@@ -176,7 +176,6 @@ export const ProjectSelector: React.FC<ProjectSelectorProps> = ({
                   <div className="project-card-header">
                     <h3>{project.name}</h3>
                     <div className="project-header-actions">
-                      <span className="project-status">未开始</span>
                       <button
                         className="btn-delete"
                         onClick={(e) => handleDeleteProject(e, project)}
@@ -238,13 +237,6 @@ export const ProjectSelector: React.FC<ProjectSelectorProps> = ({
             </div>
             <div className="modal-footer">
               <button
-                onClick={handleCancelCreate}
-                className="btn-secondary"
-                disabled={isCreating}
-              >
-                取消
-              </button>
-              <button
                 onClick={handleCreateProject}
                 disabled={isCreating || !projectName.trim()}
                 className="btn-primary"
@@ -276,13 +268,6 @@ export const ProjectSelector: React.FC<ProjectSelectorProps> = ({
               </div>
             </div>
             <div className="modal-footer">
-              <button
-                onClick={cancelDelete}
-                className="btn-secondary"
-                disabled={isDeleting}
-              >
-                取消
-              </button>
               <button
                 onClick={confirmDelete}
                 disabled={isDeleting}

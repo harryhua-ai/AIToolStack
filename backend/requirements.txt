@@ -11,4 +11,16 @@ Pillow==10.1.0
 aiofiles==23.2.1
 sqlalchemy==2.0.23
 amqtt==0.11.0
-
+ultralytics>=8.3.229
+pyyaml==6.0.2
+hydra-core>=1.3.2
+munch>=4.0.0
+tensorflow>=2.0.0,<=2.19.0
+tf_keras<=2.19.0
+sng4onnx>=1.0.1
+onnx_graphsurgeon>=0.3.26
+ai-edge-litert>=1.2.0,<1.4.0
+onnx>=1.12.0,<=1.19.1
+onnx2tf>=1.26.3
+onnxslim>=0.1.71
+onnxruntime

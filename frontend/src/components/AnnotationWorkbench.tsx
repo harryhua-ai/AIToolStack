@@ -4,6 +4,7 @@ import { AnnotationCanvas } from './AnnotationCanvas';
 import { ControlPanel } from './ControlPanel';
 import { ShortcutHelper } from './ShortcutHelper';
 import { MQTTGuide } from './MQTTGuide';
+import { TrainingPanel } from './TrainingPanel';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { API_BASE_URL } from '../config';
 import { IoArrowBack, IoDownload, IoChevronDown } from 'react-icons/io5';
@@ -68,6 +69,7 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [showTrainingPanel, setShowTrainingPanel] = useState(false);
   const exportMenuRef = React.useRef<HTMLDivElement>(null);
 
   // 点击外部关闭下拉菜单
@@ -472,6 +474,13 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
           
           <MQTTGuide projectId={project.id} projectName={project.name} />
           
+          <button
+            className="btn-export"
+            onClick={() => setShowTrainingPanel(true)}
+          >
+            训练模型
+          </button>
+          
           <div className="export-dropdown" ref={exportMenuRef}>
             <button
               className="btn-export"
@@ -578,6 +587,13 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
           onImageDelete={fetchImages}
         />
       </div>
+      
+      {showTrainingPanel && (
+        <TrainingPanel
+          projectId={project.id}
+          onClose={() => setShowTrainingPanel(false)}
+        />
+      )}
     </div>
   );
 };
