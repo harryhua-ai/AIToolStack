@@ -1,5 +1,5 @@
 services:
-  aitoolstack:
+  camthink:
     build:
       context: .
       dockerfile: Dockerfile
