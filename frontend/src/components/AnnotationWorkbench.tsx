@@ -84,6 +84,7 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
   const annotationCacheRef = React.useRef<Record<number, Annotation[]>>({});
   const annotationsAbortRef = React.useRef<AbortController | null>(null);
   const imageListRefreshTimeoutRef = React.useRef<number | null>(null);
+  const previousImageIdRef = React.useRef<number | null>(null); // Track current image ID to detect changes
 
   // Close dropdown menu when clicking outside
   useEffect(() => {
@@ -116,6 +117,7 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
       
       const data = await response.json();
       
+      // Update images list
       setImages(prevImages => {
         const previousLength = prevImages.length;
         
@@ -127,14 +129,45 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
         return data;
       });
       
-      // Selection logic:
+      // Selection logic with image ID tracking:
       // 1) On first load or after clearing, select first image
       // 2) If current index exceeds new length (added/deleted), clamp to last image
       // 3) If image added via WebSocket notification, keep current selection (don't auto-switch)
+      // 4) Check if current index's image ID changed - if so, we need to reload annotations
       setCurrentImageIndex(prevIndex => {
-        if (data.length === 0) return -1;
-        if (prevIndex === -1) return 0;
-        if (prevIndex >= data.length) return data.length - 1;
+        if (data.length === 0) {
+          previousImageIdRef.current = null;
+          return -1;
+        }
+        if (prevIndex === -1) {
+          previousImageIdRef.current = data[0]?.id ?? null;
+          return 0;
+        }
+        if (prevIndex >= data.length) {
+          const newIndex = data.length - 1;
+          previousImageIdRef.current = data[newIndex]?.id ?? null;
+          return newIndex;
+        }
+        
+        // Check if image ID at current index has changed
+        const currentImageId = data[prevIndex]?.id;
+        const trackedPreviousImageId = previousImageIdRef.current;
+        
+        // If image ID changed, we need to clear annotations and reload
+        if (currentImageId !== trackedPreviousImageId && currentImageId !== undefined && trackedPreviousImageId !== null) {
+          console.log(`[Image List] Image ID changed at index ${prevIndex}: ${trackedPreviousImageId} -> ${currentImageId}`);
+          // Clear annotations immediately to prevent showing wrong annotations
+          setAnnotations([]);
+          setHistory([[]]);
+          setHistoryIndex(0);
+          setSelectedAnnotationId(null);
+        }
+        
+        // Update tracked image ID
+        if (currentImageId !== undefined) {
+          previousImageIdRef.current = currentImageId;
+        }
+        
         // If new images are added (length increased) but current image is selected, keep current selection
         // This prevents users from being interrupted by new images
         return prevIndex;
@@ -171,20 +204,37 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
       setAnnotations([]);
       setHistory([[]]);
       setHistoryIndex(0);
+      previousImageIdRef.current = null;
       return;
     }
 
     const imageId = images[currentImageIndex].id;
     
-    // Try to use cache to improve switching speed
+    // Check if we're switching to a different image (image ID changed)
+    const previousImageId = previousImageIdRef.current;
+    const imageChanged = previousImageId !== imageId && previousImageId !== null;
+    
+    // If image changed, clear annotations immediately to prevent showing wrong annotations
+    if (imageChanged) {
+      setAnnotations([]);
+      setHistory([[]]);
+      setHistoryIndex(0);
+      setSelectedAnnotationId(null);
+    }
+    
+    // Update tracked image ID
+    previousImageIdRef.current = imageId;
+    
+    // Try to use cache to improve switching speed (only if image ID hasn't changed)
     const cached = annotationCacheRef.current[imageId];
-    if (cached) {
+    if (cached && !imageChanged) {
+      // Use cache only if we're still on the same image (optimistic display)
       setAnnotations(cached);
       setHistory([cached]);
       setHistoryIndex(0);
       setSelectedAnnotationId(null);
-    } else {
-      // Clear when no cache to avoid showing previous image's annotations
+    } else if (!cached) {
+      // No cache and image changed, clear annotations to show loading state
       setAnnotations([]);
       setHistory([[]]);
       setHistoryIndex(0);
@@ -207,6 +257,12 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
       }
       const data = await response.json();
 
+      // Verify we're still on the same image (image ID might have changed during fetch)
+      if (images[currentImageIndex]?.id !== imageId) {
+        console.log(`[Annotations] Image changed during fetch, ignoring results for image ${imageId}`);
+        return;
+      }
+
       // Normalize annotation fields, ensure classId exists
       const annotationsList = (data.annotations || []).map((ann: any) => ({
         ...ann,
@@ -223,6 +279,9 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
       // Reset history to new image's annotation history
       setHistory([annotationsList]);
       setHistoryIndex(0);
+      
+      // Update tracked image ID to match
+      previousImageIdRef.current = imageId;
 
       // Prefetch annotations of neighbor images in background to speed up navigation
       const neighborIndices = [currentImageIndex - 1, currentImageIndex + 1];
@@ -296,8 +355,23 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
 
     if (message.type === 'new_image') {
       console.log('[WebSocket] New image notification received:', message);
+      // When new image is added, clear annotations to prevent showing old image's annotations
+      // The annotations will be reloaded after image list refresh if current image is still selected
+      setAnnotations([]);
+      setHistory([[]]);
+      setHistoryIndex(0);
+      setSelectedAnnotationId(null);
       // Schedule refresh with a small delay to ensure database commit is complete
       // For new images, we want to refresh even if user is currently viewing an image
+      scheduleRefreshImages(false);
+    } else if (message.type === 'image_deleted') {
+      console.log('[WebSocket] Image deleted notification received:', message);
+      const deletedImageId = message.image_id;
+      // Clear cache for deleted image
+      if (annotationCacheRef.current[deletedImageId]) {
+        delete annotationCacheRef.current[deletedImageId];
+      }
+      // Refresh image list - this will adjust currentImageIndex if needed
       scheduleRefreshImages(false);
     } else if (message.type === 'image_status_updated') {
       // Image status updated (annotation create/delete causes status change)
@@ -348,9 +422,10 @@ export const AnnotationWorkbench: React.FC<AnnotationWorkbenchProps> = ({
   useEffect(() => {
     // Only re-load annotations when the current image index changes,
     // avoid repeated loading when image list status updates
+    // Also reload when images array changes (new images added/deleted)
     fetchAnnotations();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentImageIndex]);
+  }, [currentImageIndex, images]);
 
   // Preload neighbor images to make switching smoother
   useEffect(() => {
