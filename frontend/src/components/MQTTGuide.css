@@ -131,6 +131,26 @@
   color: #52c41a;
 }
 
+.mqtt-notice.warning {
+  background: var(--warning-light);
+  border: 1px solid var(--warning-color);
+  color: var(--warning-color);
+}
+
+.mqtt-notice.warning svg {
+  color: var(--warning-color);
+}
+
+.mqtt-notice.info {
+  background: var(--info-light);
+  border: 1px solid var(--info-color);
+  color: var(--text-secondary);
+}
+
+.mqtt-notice.info svg {
+  color: var(--info-color);
+}
+
 .broker-type-badge {
   padding: var(--spacing-xs) var(--spacing-sm);
   border-radius: var(--radius-full);

@@ -1,0 +1,2 @@
+# This file ensures the certs directory is tracked by Git
+# All certificate files in this directory are auto-generated during deployment

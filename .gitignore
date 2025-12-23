@@ -55,3 +55,11 @@ Thumbs.db
 logs/
 
 ne301/
+
+# Mosquitto - Sensitive files and runtime-generated files
+# All certificates and keys are auto-generated during deployment
+mosquitto/config/passwordfile
+mosquitto/config/certs/*
+!mosquitto/config/certs/.gitkeep
+mosquitto/config/certs/**/*
+!mosquitto/config/certs/.gitkeep

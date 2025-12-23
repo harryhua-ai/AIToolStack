@@ -5,16 +5,24 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: camthink-aitoolstack
+    depends_on:
+      - mosquitto
     ports:
       # Format: host_ip:host_port:container_port
       # Use 0.0.0.0 to bind all network interfaces, allowing external access
       - "0.0.0.0:8000:8000"  # Web service port
-      - "0.0.0.0:1883:1883"  # MQTT port
     volumes:
       # Data persistence
       - ./datasets:/app/datasets
       - ./data:/app/data
       - backend-data:/app/backend/data
+      # Backend code (for development: code changes take effect after container restart)
+      # Note: This allows code changes without rebuilding the image
+      # - ./backend:/app/backend
+      # Frontend build files (for development: mount local build to avoid rebuilding in Docker)
+      # Note: Run 'npm run build' in frontend/ directory first, then mount ./frontend/build:/app/frontend/build
+      # If build directory doesn't exist, Dockerfile will use the built-in build from image
+      # - ./frontend/build:/app/frontend/build
       # NE301 project directory (auto-initialized)
       # Container will automatically detect on startup: if host directory is empty, auto-clone; otherwise use existing content
       # Docker-in-Docker compilation requires host path, so mounting is required (auto-initialized)
@@ -22,18 +30,28 @@ services:
       - ./ne301:/workspace/ne301  # Host directory, auto-cloned on container startup (if empty)
       # Docker socket (for running Docker commands inside container to compile NE301 models)
       - /var/run/docker.sock:/var/run/docker.sock
+      # Share Mosquitto config so backend can manage passwordfile dynamically
+      - ./mosquitto/config:/mosquitto/config
+    env_file:
+      - path: .env
+        required: false  # Optional: Create .env file manually with MQTT_BROKER_HOST=your_ip
     environment:
       - HOST=0.0.0.0
       - PORT=8000
       - DEBUG=False
       # MQTT configuration
       - MQTT_ENABLED=true
-      - MQTT_USE_BUILTIN_BROKER=true
+      # Use external Mosquitto broker instead of Python aMQTT broker
+      - MQTT_USE_BUILTIN_BROKER=false
+      - MQTT_BROKER=mosquitto
       - MQTT_PORT=1883
       - MQTT_BUILTIN_PORT=1883
-      # MQTT Broker external address (recommended to set to server's real IP address)
-      # If not set, system will try to auto-detect, but may be inaccurate in Docker environment
-      - MQTT_BROKER_HOST=192.168.110.105
+      - MQTT_BROKER_HOST=192.168.110.106
+      # MQTT Broker external address (set in .env file or environment variable)
+      # Docker Desktop uses virtual networks (e.g., 192.168.65.x) which are not your actual WiFi IP
+      # Create .env file with: MQTT_BROKER_HOST=192.168.110.106
+      # Or set via environment variable: export MQTT_BROKER_HOST=192.168.110.106
+      # MQTT_BROKER_HOST is loaded from .env file via env_file above (optional)
       # Database configuration
       - DATABASE_URL=sqlite:////app/backend/data/annotator.db
       # File storage configuration
@@ -56,6 +74,75 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: camthink-mosquitto
+    restart: unless-stopped
+    command: >
+      sh -c '
+        if [ ! -f /mosquitto/config/passwordfile ]; then
+          echo "[mosquitto-init] Creating empty Mosquitto passwordfile (no default users)";
+          touch /mosquitto/config/passwordfile || {
+            echo "[mosquitto-init] Failed to create password file";
+          };
+          # Set secure permissions (read/write for owner only)
+          chmod 600 /mosquitto/config/passwordfile || {
+            echo "[mosquitto-init] Failed to set password file permissions";
+          };
+        else
+          # Ensure existing passwordfile has correct permissions
+          chmod 600 /mosquitto/config/passwordfile || {
+            echo "[mosquitto-init] Failed to set password file permissions";
+          };
+        fi;
+        # Auto-generate self-signed TLS certificates for MQTTS if not present
+        # Requires openssl inside the container. Install it on first start.
+        if [ ! -f /mosquitto/config/certs/server.crt ] || [ ! -f /mosquitto/config/certs/server.key ]; then
+          echo "[mosquitto-init] Generating self-signed TLS certificates for MQTTS (development use only)";
+          apk add --no-cache openssl >/dev/null 2>&1 || {
+            echo "[mosquitto-init] Failed to install openssl, skipping TLS cert generation";
+          };
+          mkdir -p /mosquitto/config/certs;
+          if command -v openssl >/dev/null 2>&1; then
+            # Generate CA key and certificate
+            openssl req -new -x509 -days 3650 -nodes \
+              -subj "/C=CN/ST=Local/L=Local/O=Camthink/OU=Dev/CN=Camthink-Local-CA" \
+              -keyout /mosquitto/config/certs/ca.key \
+              -out /mosquitto/config/certs/ca.crt >/dev/null 2>&1 || {
+                echo "[mosquitto-init] Failed to generate CA certificate";
+              };
+            # Generate server key and CSR
+            openssl req -new -nodes \
+              -subj "/C=CN/ST=Local/L=Local/O=Camthink/OU=Dev/CN=mosquitto" \
+              -keyout /mosquitto/config/certs/server.key \
+              -out /mosquitto/config/certs/server.csr >/dev/null 2>&1 || {
+                echo "[mosquitto-init] Failed to generate server CSR";
+              };
+            # Sign server certificate with our CA
+            openssl x509 -req -days 3650 \
+              -in /mosquitto/config/certs/server.csr \
+              -CA /mosquitto/config/certs/ca.crt \
+              -CAkey /mosquitto/config/certs/ca.key \
+              -CAcreateserial \
+              -out /mosquitto/config/certs/server.crt >/dev/null 2>&1 || {
+                echo "[mosquitto-init] Failed to sign server certificate";
+              };
+            chmod 600 /mosquitto/config/certs/server.key || true;
+          else
+            echo "[mosquitto-init] openssl not available, TLS listener will require manual certificates";
+          fi;
+        fi;
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+      '
+    ports:
+      # Expose MQTT ports on host
+      - "0.0.0.0:1883:1883"  # MQTT
+      - "0.0.0.0:8883:8883"  # MQTTS (TLS)
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
 
 volumes:
   backend-data:

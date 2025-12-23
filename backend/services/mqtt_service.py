@@ -11,11 +11,14 @@ from collections import deque
 import paho.mqtt.client as mqtt
 from PIL import Image as PILImage
 import io
+import hashlib
 
 from backend.config import settings
 from backend.models.database import SessionLocal, Image, Project
 from backend.services.websocket_manager import websocket_manager
 from backend.services.mqtt_broker import builtin_mqtt_broker
+from backend.services.mqtt_config_service import MQTTConfig, mqtt_config_service
+from backend.services.external_broker_service import external_broker_service
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +26,24 @@ logger = logging.getLogger(__name__)
 class MQTTService:
     """MQTT subscription service"""
     
-    def __init__(self):
+    def __init__(self, config_service=mqtt_config_service):
+        # For backward compatibility, self.client keeps a reference to the
+        # first created MQTT client (primary broker). When multi-broker
+        # support is enabled (mode == \"both\"), additional clients are stored
+        # in self.clients and callbacks receive the actual client instance.
         self.client: Optional[mqtt.Client] = None
+        self.clients: list[mqtt.Client] = []
+        # Track last known broker endpoints and their connection states.
+        # Each item: {"type": "builtin"|"external", "host": str, "port": int, "connected": bool}
+        self._endpoints: list[dict] = []
         self.is_connected = False
-        self.broker_host = ""  # Save current connected broker address
+        # For multi-broker scenarios, these fields reflect the *primary* broker
+        # (the first one in the list); logging for each client uses per-client
+        # attributes instead.
+        self.broker_host = ""  # Save current connected broker address (primary)
         self.broker_port = 0
+        self._config_service = config_service
+        self._config: Optional[MQTTConfig] = None
         
         # Connection statistics and monitoring
         self.connection_count = 0
@@ -37,6 +53,12 @@ class MQTTService:
         self.recent_errors = deque(maxlen=10)  # Keep last 10 errors
         self.message_count = 0
         self.last_message_time: Optional[float] = None
+        
+        # Deduplication: Track processed messages to prevent duplicate image uploads
+        # Format: {message_id: timestamp}
+        # Messages older than 1 hour are automatically removed
+        self._processed_messages: dict[str, float] = {}
+        self._dedup_cleanup_interval = 3600  # 1 hour in seconds
     
     def on_connect(self, client, userdata, flags, rc):
         """Connection callback"""
@@ -44,14 +66,22 @@ class MQTTService:
             self.is_connected = True
             self.connection_count += 1
             self.last_connect_time = time.time()
-            logger.info(f"Connected to broker at {self.broker_host}:{self.broker_port}")
-            # Subscribe to upload topic
+            # Prefer per-client broker metadata if available
+            broker_host = getattr(client, "_camthink_broker_host", self.broker_host)
+            broker_port = getattr(client, "_camthink_broker_port", self.broker_port)
+            broker_index = getattr(client, "_camthink_broker_index", None)
+            if isinstance(broker_index, int) and 0 <= broker_index < len(self._endpoints):
+                self._endpoints[broker_index]["connected"] = True
+            logger.info(f"Connected to broker at {broker_host}:{broker_port}")
+            # Subscribe to topic pattern (broker-specific or default)
+            topic_pattern = getattr(client, "_camthink_topic_pattern", settings.MQTT_UPLOAD_TOPIC)
+            broker_qos = getattr(client, "_camthink_broker_qos", settings.MQTT_QOS)
             try:
-                result = client.subscribe(settings.MQTT_UPLOAD_TOPIC, qos=settings.MQTT_QOS)
+                result = client.subscribe(topic_pattern, qos=broker_qos)
                 if result[0] == mqtt.MQTT_ERR_SUCCESS:
-                    logger.info(f"Subscribed to topic: {settings.MQTT_UPLOAD_TOPIC}")
+                    logger.info(f"Subscribed to topic pattern: {topic_pattern} (QoS: {broker_qos})")
                 else:
-                    logger.error(f"Failed to subscribe to topic {settings.MQTT_UPLOAD_TOPIC}: error code {result[0]}")
+                    logger.error(f"Failed to subscribe to topic {topic_pattern}: error code {result[0]}")
             except Exception as e:
                 logger.error(f"Error subscribing to topic: {e}")
         else:
@@ -66,14 +96,21 @@ class MQTTService:
     
     def on_disconnect(self, client, userdata, rc):
         """Disconnect callback"""
-        self.is_connected = False
+        broker_index = getattr(client, "_camthink_broker_index", None)
+        if isinstance(broker_index, int) and 0 <= broker_index < len(self._endpoints):
+            self._endpoints[broker_index]["connected"] = False
+        # Recompute overall connection flag based on all endpoints
+        # If any broker is connected, consider service as connected
+        self.is_connected = any(ep.get("connected", False) for ep in self._endpoints)
         self.disconnection_count += 1
         self.last_disconnect_time = time.time()
         
         if rc != 0:
             # Abnormal disconnect - paho-mqtt will automatically try to reconnect
             error_msg = self._get_disconnect_error_message(rc)
-            logger.warning(f"Disconnected from broker unexpectedly (rc={rc}): {error_msg}")
+            broker_host = getattr(client, "_camthink_broker_host", self.broker_host)
+            broker_port = getattr(client, "_camthink_broker_port", self.broker_port)
+            logger.warning(f"Disconnected from broker {broker_host}:{broker_port} unexpectedly (rc={rc}): {error_msg}")
             self.recent_errors.append({
                 'time': time.time(),
                 'type': 'disconnect_error',
@@ -115,13 +152,13 @@ class MQTTService:
                 device_id = ''
                 try:
                     temp_data = json.loads(payload)  # This will fail, but we try
-                except:
+                except Exception:
                     pass
-                self._send_error_response(req_id, device_id, "Invalid JSON format")
+                self._send_error_response(client, req_id, device_id, "Invalid JSON format")
                 return
             
             # Handle image upload
-            self._handle_image_upload(project_id, data, topic)
+            self._handle_image_upload(client, project_id, data, topic)
             
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
@@ -133,10 +170,67 @@ class MQTTService:
                 device_id = data.get('device_id', '')
             except:
                 pass
-            self._send_error_response(req_id, device_id, str(e))
+            self._send_error_response(client, req_id, device_id, str(e))
     
-    def _handle_image_upload(self, project_id: str, data: dict, topic: str):
+    def _get_message_id(self, data: dict, topic: str) -> str:
+        """Generate a unique message ID for deduplication.
+        
+        Uses req_id if available, otherwise creates a hash from topic + payload.
+        """
+        req_id = data.get('req_id')
+        if req_id:
+            return f"req_{req_id}"
+        
+        # Fallback: create hash from topic + device_id + timestamp
+        device_id = data.get('device_id', 'unknown')
+        timestamp = data.get('timestamp', '')
+        # For new format, use image_id from metadata if available
+        if 'image_data' in data:
+            metadata = data.get('metadata', {})
+            image_id = metadata.get('image_id', '')
+            if image_id:
+                return f"img_{image_id}"
+        
+        # Last resort: hash of topic + device_id + timestamp
+        content = f"{topic}:{device_id}:{timestamp}"
+        return f"hash_{hashlib.md5(content.encode()).hexdigest()}"
+    
+    def _is_duplicate_message(self, message_id: str) -> bool:
+        """Check if message has already been processed.
+        
+        Also performs cleanup of old entries to prevent memory growth.
+        """
+        current_time = time.time()
+        
+        # Cleanup old entries (older than 1 hour)
+        if len(self._processed_messages) > 1000:  # Only cleanup when dict is large
+            cutoff_time = current_time - self._dedup_cleanup_interval
+            self._processed_messages = {
+                msg_id: ts for msg_id, ts in self._processed_messages.items()
+                if ts > cutoff_time
+            }
+        
+        # Check if message was already processed
+        if message_id in self._processed_messages:
+            return True
+        
+        # Mark as processed
+        self._processed_messages[message_id] = current_time
+        return False
+    
+    def _handle_image_upload(self, client, project_id: str, data: dict, topic: str):
         """Handle image upload"""
+        # Check for duplicate messages to prevent processing the same image multiple times
+        # This can happen when multiple MQTT clients subscribe to the same topic
+        message_id = self._get_message_id(data, topic)
+        if self._is_duplicate_message(message_id):
+            logger.warning(f"Duplicate message detected (message_id: {message_id}), skipping processing")
+            # Still send success response to avoid device retries
+            req_id = data.get('req_id', '')
+            device_id = data.get('device_id', 'unknown')
+            self._send_success_response(client, req_id, device_id, project_id)
+            return
+        
         # Adapt to new data structure
         # Support two formats:
         # 1. New format: { "image_data": "...", "encoding": "...", "metadata": {...} }
@@ -188,7 +282,7 @@ class MQTTService:
             if not project:
                 error_msg = f"Project {project_id} not found"
                 logger.warning(error_msg)
-                self._send_error_response(req_id, device_id, error_msg)
+                self._send_error_response(client, req_id, device_id, error_msg)
                 return
             
             # Process base64 data, remove possible data URI prefix
@@ -275,7 +369,7 @@ class MQTTService:
             logger.info(f"Image saved: {filename} ({img_width}x{img_height}) to project {project_id}, image_id: {image_id}")
             
             # Send success response
-            self._send_success_response(req_id, device_id, project_id)
+            self._send_success_response(client, req_id, device_id, project_id)
             
             # Notify frontend via WebSocket (after database commit is complete)
             try:
@@ -296,18 +390,25 @@ class MQTTService:
             db.rollback()
             error_msg = f"Failed to save image: {str(e)}"
             logger.error(error_msg, exc_info=True)
-            self._send_error_response(req_id, device_id, error_msg)
+            self._send_error_response(client, req_id, device_id, error_msg)
         finally:
             db.close()
     
-    def _send_success_response(self, req_id: str, device_id: str, project_id: str):
+    def _send_success_response(self, client, req_id: str, device_id: str, project_id: str):
         """Send success response"""
         if not device_id or device_id == 'unknown':
             return
         
-        if not self.client or not self.is_connected:
+        if not client or not self.is_connected:
             logger.warning(f"Cannot send success response: client not connected")
             return
+        
+        # Get broker-specific QoS
+        broker_type = getattr(client, "_camthink_broker_type", "builtin")
+        if self._config:
+            qos = self._config.builtin_qos if broker_type == "builtin" else self._config.external_qos
+        else:
+            qos = settings.MQTT_QOS
         
         response_topic = f"{settings.MQTT_RESPONSE_TOPIC_PREFIX}/{device_id}"
         response = {
@@ -319,20 +420,27 @@ class MQTTService:
         }
         
         try:
-            result = self.client.publish(response_topic, json.dumps(response), qos=settings.MQTT_QOS)
+            result = client.publish(response_topic, json.dumps(response), qos=qos)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 logger.warning(f"Failed to publish success response: error code {result.rc}")
         except Exception as e:
             logger.error(f"Error publishing success response: {e}")
     
-    def _send_error_response(self, req_id: str, device_id: str, error_message: str):
+    def _send_error_response(self, client, req_id: str, device_id: str, error_message: str):
         """Send error response"""
         if not device_id or device_id == 'unknown':
             return
         
-        if not self.client or not self.is_connected:
+        if not client or not self.is_connected:
             logger.warning(f"Cannot send error response: client not connected")
             return
+        
+        # Get broker-specific QoS
+        broker_type = getattr(client, "_camthink_broker_type", "builtin")
+        if self._config:
+            qos = self._config.builtin_qos if broker_type == "builtin" else self._config.external_qos
+        else:
+            qos = settings.MQTT_QOS
         
         response_topic = f"{settings.MQTT_RESPONSE_TOPIC_PREFIX}/{device_id}"
         response = {
@@ -344,7 +452,7 @@ class MQTTService:
         }
         
         try:
-            result = self.client.publish(response_topic, json.dumps(response), qos=settings.MQTT_QOS)
+            result = client.publish(response_topic, json.dumps(response), qos=qos)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 logger.warning(f"Failed to publish error response: error code {result.rc}")
         except Exception as e:
@@ -379,6 +487,16 @@ class MQTTService:
         return {
             'connected': self.is_connected,
             'broker': f"{self.broker_host}:{self.broker_port}" if self.broker_host else None,
+            'brokers': [
+                {
+                    'type': ep.get("type"),
+                    'host': ep.get("host"),
+                    'port': ep.get("port"),
+                    'broker_id': ep.get("broker_id"),  # For external brokers
+                    'connected': ep.get("connected", False),
+                }
+                for ep in self._endpoints
+            ],
             'connection_count': self.connection_count,
             'disconnection_count': self.disconnection_count,
             'message_count': self.message_count,
@@ -389,85 +507,396 @@ class MQTTService:
         }
     
     def start(self):
-        """Start MQTT client"""
-        if not settings.MQTT_ENABLED:
+        """Start MQTT client using runtime configuration."""
+        print("[MQTT Service] ===== start() method called =====")
+        logger.info("[MQTT Service] ===== start() method called =====")
+        # Load current config
+        self._config = self._config_service.load_config()
+        print(f"[MQTT Service] Config loaded: enabled={self._config.enabled}, builtin_protocol={self._config.builtin_protocol}")
+        logger.info(f"[MQTT Service] Config loaded: enabled={self._config.enabled}, builtin_protocol={self._config.builtin_protocol}")
+        # Reset previous clients list
+        self.clients = []
+        self._endpoints = []
+
+        if not self._config.enabled:
             logger.info("MQTT service is disabled in configuration")
             return
         
         try:
-            # Explicitly specify MQTT 3.1.1 protocol (aMQTT broker doesn't support MQTT 5.0)
-            # protocol=mqtt.MQTTv311 means using MQTT 3.1.1
-            # Set clean_session=True to ensure connection is clean
-            self.client = mqtt.Client(
-                client_id=f"annotator_server_{uuid.uuid4().hex[:8]}",
-                protocol=mqtt.MQTTv311,
-                clean_session=True
-            )
-            
-            # Set connection timeout and retry parameters
-            self.client.reconnect_delay_set(min_delay=1, max_delay=120)
-            
-            # Set callbacks
-            self.client.on_connect = self.on_connect
-            self.client.on_disconnect = self.on_disconnect
-            self.client.on_message = self.on_message
-            
-            # Determine Broker address to connect to
-            if settings.MQTT_USE_BUILTIN_BROKER:
-                # Built-in Broker binds to 0.0.0.0, client in same container should connect to localhost
-                # This is more reliable, avoids connection issues caused by container internal IP
-                self.broker_host = "127.0.0.1"  # Use localhost connection in container
-                self.broker_port = settings.MQTT_BUILTIN_PORT
-                logger.info(f"Using built-in MQTT Broker at {self.broker_host}:{self.broker_port}")
+            cfg = self._config
+
+            # Build a list of broker endpoints to connect to
+            endpoints = []
+            # Built-in broker endpoint used by the training/annotation service.
+            # 当使用 Python 内置 aMQTT 时，指向容器内的 127.0.0.1:MQTT_BUILTIN_PORT；
+            # 当关闭内置 broker（MQTT_USE_BUILTIN_BROKER=false）时，把“内置”端点指向外部 broker，
+            # 这样前端的“内置 MQTT Broker 状态”就反映我们实际使用的 Mosquitto/外部服务。
+            from backend.config import settings as app_settings  # 避免循环引用
+
+            # Client connection automatically infers protocol and port from broker configuration
+            # - If broker_protocol is "mqtts", client connects to TLS port (8883)
+            # - If broker_protocol is "mqtt", client connects to TCP port (1883)
+            # This ensures client always matches broker's actual configuration
+            if cfg.builtin_protocol == "mqtts":
+                # Broker is configured for MQTTS, client connects to TLS port
+                builtin_port = cfg.builtin_tls_port or 8883
+                client_protocol = "mqtts"
             else:
-                self.broker_host = settings.MQTT_BROKER
-                self.broker_port = settings.MQTT_PORT
-                logger.info(f"Connecting to external MQTT Broker at {self.broker_host}:{self.broker_port}")
-                # External Broker requires authentication
-                if settings.MQTT_USERNAME and settings.MQTT_PASSWORD:
-                    self.client.username_pw_set(settings.MQTT_USERNAME, settings.MQTT_PASSWORD)
+                # Broker is configured for MQTT, client connects to TCP port
+                builtin_port = cfg.builtin_tcp_port or app_settings.MQTT_BUILTIN_PORT
+                client_protocol = "mqtt"
+
+            if app_settings.MQTT_USE_BUILTIN_BROKER:
+                builtin_host = "127.0.0.1"
+            else:
+                # 不使用内置 broker 时，将“内置”连接指向外部 broker（例如 mosquitto）
+                # 在 docker-compose 中通过 MQTT_BROKER=mosquitto 注入
+                builtin_host = app_settings.MQTT_BROKER or "localhost"
+
+            endpoints.append(
+                {
+                    "type": "builtin",
+                    "host": builtin_host,
+                    "port": builtin_port,
+                    "protocol": client_protocol,  # Client protocol matches broker protocol automatically
+                    "connected": False,
+                }
+            )
+            # Multiple external brokers from database
+            try:
+                external_brokers = external_broker_service.get_enabled_brokers()
+                for broker in external_brokers:
+                    endpoints.append(
+                        {
+                            "type": "external",
+                            "host": broker.host,
+                            "port": broker.port,
+                            "protocol": broker.protocol,
+                            "connected": False,
+                            "broker_id": broker.id,
+                            "broker_name": broker.name,
+                            "username": broker.username,
+                            "password": broker.password,
+                            "qos": broker.qos,
+                            "keepalive": broker.keepalive,
+                            "tls_enabled": broker.tls_enabled,
+                            "tls_ca_cert_path": broker.tls_ca_cert_path,
+                            "tls_client_cert_path": broker.tls_client_cert_path,
+                            "tls_client_key_path": broker.tls_client_key_path,
+                            # tls_insecure_skip_verify is not applicable - AIToolStack as client should always verify
+                            # topic_pattern is None - will use default from settings in MQTT service
+                            "topic_pattern": None,
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load external brokers from database: {e}")
+                # Fallback to legacy single external broker config
+                if cfg.external_enabled and (cfg.external_host or cfg.external_port):
+                    endpoints.append(
+                        {
+                            "type": "external",
+                            "host": cfg.external_host or settings.MQTT_BROKER,
+                            "port": cfg.external_port or settings.MQTT_PORT,
+                            "protocol": cfg.external_protocol,
+                            "connected": False,
+                            "broker_id": None,
+                            "broker_name": "Legacy External Broker",
+                            "username": cfg.external_username,
+                            "password": cfg.external_password,
+                            "qos": cfg.external_qos,
+                            "keepalive": cfg.external_keepalive,
+                            "tls_enabled": cfg.external_tls_enabled,
+                            "tls_ca_cert_path": cfg.external_tls_ca_cert_path,
+                            "tls_client_cert_path": cfg.external_tls_client_cert_path,
+                            "tls_client_key_path": cfg.external_tls_client_key_path,
+                            # tls_insecure_skip_verify is not applicable - AIToolStack as client should always verify
+                            # topic_pattern is None - will use default from settings in MQTT service
+                            "topic_pattern": None,
+                        }
+                    )
+
+            if not endpoints:
+                logger.warning("MQTT config resulted in no endpoints to connect to")
+                return
+
+            # Initialize endpoint tracking
+            self._endpoints = endpoints.copy()
+
+            # Keep the first endpoint as primary for backward compatible fields
+            primary = endpoints[0]
+            self.broker_host = primary["host"]
+            self.broker_port = primary["port"]
+
+            # Create and connect a client for each endpoint
+            import ssl
+
+            for idx, ep in enumerate(endpoints):
+                print(f"[MQTT Service] Creating client for endpoint {idx}: type={ep['type']}, host={ep['host']}, port={ep['port']}, protocol={ep.get('protocol', 'N/A')}")
+                logger.info(f"[MQTT Service] Creating client for endpoint {idx}: type={ep['type']}, host={ep['host']}, port={ep['port']}, protocol={ep.get('protocol', 'N/A')}")
+                client = mqtt.Client(
+                    client_id=f"annotator_server_{ep['type']}_{uuid.uuid4().hex[:8]}",
+                    protocol=mqtt.MQTTv311,
+                    clean_session=True,
+                )
+
+                # Attach endpoint info for logging
+                setattr(client, "_camthink_broker_host", ep["host"])
+                setattr(client, "_camthink_broker_port", ep["port"])
+                setattr(client, "_camthink_broker_type", ep["type"])
+                setattr(client, "_camthink_broker_index", idx)
+                # Store broker_id for external brokers
+                if ep.get("broker_id") is not None:
+                    setattr(client, "_camthink_broker_id", ep["broker_id"])
+                # Store broker-specific QoS
+                if ep["type"] == "builtin":
+                    setattr(client, "_camthink_broker_qos", cfg.builtin_qos)
+                else:
+                    setattr(client, "_camthink_broker_qos", ep.get("qos", cfg.external_qos))
+
+                # Set connection timeout and retry parameters
+                client.reconnect_delay_set(min_delay=1, max_delay=120)
+
+                # Set callbacks
+                client.on_connect = self.on_connect
+                client.on_disconnect = self.on_disconnect
+                client.on_message = self.on_message
             
-            # Connect to Broker
-            # Increase keepalive time to reduce timeout disconnection issues
-            # Set connect timeout to avoid hanging
-            self.client.connect(self.broker_host, self.broker_port, keepalive=120)
-            logger.info(f"Starting MQTT client loop...")
-            self.client.loop_start()
+                # Configure broker-specific settings
+                if ep["type"] == "builtin":
+                    # Built-in broker configuration
+                    # 当 MQTT_USE_BUILTIN_BROKER=true 时，通常是 Python 内置 aMQTT；
+                    # 当 MQTT_USE_BUILTIN_BROKER=false 时，“builtin” 端点会被指向外部 Mosquitto，
+                    # 这里统一负责设置认证信息。
+                    protocol = ep.get("protocol", cfg.builtin_protocol)  # Use protocol from endpoint (already inferred from broker config)
+                    keepalive = cfg.builtin_keepalive or 120  # Client-side keepalive (independent of broker)
+                    topic_pattern = settings.MQTT_UPLOAD_TOPIC
+                    print(f"[Client Connection] Connecting to built-in broker: protocol={protocol}, port={ep['port']}, host={ep['host']}")
+                    logger.info(f"[Client Connection] Connecting to built-in broker: protocol={protocol}, port={ep['port']}, host={ep['host']}")
+
+                    # Authentication: Client automatically uses broker's authentication settings
+                    # - If broker allows anonymous: client connects anonymously
+                    # - If broker requires auth: client uses broker's username/password (same as external devices)
+                    if not cfg.builtin_allow_anonymous:
+                        from backend.config import settings as app_settings
+                        builtin_username = cfg.builtin_username or getattr(app_settings, "MQTT_USERNAME", None)
+                        builtin_password = cfg.builtin_password or getattr(app_settings, "MQTT_PASSWORD", None)
+                        if builtin_username and builtin_password:
+                            client.username_pw_set(builtin_username, builtin_password)
+                            print(f"[Client Connection] Using broker authentication: username={builtin_username}")
+                            logger.info(f"[Client Connection] Using broker authentication: username={builtin_username}")
+                        else:
+                            print(f"[Client Connection] WARNING: Broker requires authentication but no credentials configured")
+                            logger.warning("[Client Connection] Broker requires authentication but no credentials configured")
+                    else:
+                        print(f"[Client Connection] Broker allows anonymous, connecting without credentials")
+                        logger.info("[Client Connection] Broker allows anonymous, connecting without credentials")
+
+                    # TLS configuration: Client automatically uses broker's TLS configuration
+                    # - If broker_protocol is "mqtts", client connects via TLS
+                    # - Client uses broker's CA certificate to verify server certificate
+                    # - Client uses broker's client certificate/key if configured (for mTLS)
+                    if protocol == "mqtts":
+                        print(f"[Client TLS] ===== Configuring TLS for client connection (broker protocol: {protocol}, port: {ep['port']}) =====")
+                        logger.info(f"[Client TLS] Configuring TLS for client connection (broker protocol: {protocol}, port: {ep['port']})")
+                        # Client uses broker's CA certificate to verify server certificate
+                        # Since AIToolStack and broker are deployed together, we can access the CA file directly
+                        tls_kwargs = {
+                            "tls_version": ssl.PROTOCOL_TLSv1_2
+                        }
+                        
+                        # Use CA certificate for certificate verification (required for security)
+                        if cfg.builtin_tls_ca_cert_path:
+                            # Check if CA certificate file exists
+                            import os
+                            ca_path = cfg.builtin_tls_ca_cert_path
+                            print(f"[TLS Config] CA certificate path from config: {ca_path}")
+                            if os.path.exists(ca_path):
+                                tls_kwargs["ca_certs"] = ca_path
+                                tls_kwargs["cert_reqs"] = ssl.CERT_REQUIRED  # Require certificate verification
+                                print(f"[TLS Config] ✓ CA certificate found, setting cert_reqs=CERT_REQUIRED")
+                                print(f"[TLS Config] ✓ ca_certs={ca_path}")
+                                logger.info(f"[TLS Config] Using CA certificate for verification: {ca_path}")
+                            else:
+                                error_msg = f"CA certificate file not found: {ca_path}"
+                                print(f"[TLS Config] ✗ ERROR: {error_msg}")
+                                logger.error(f"[TLS Config] {error_msg}")
+                                raise FileNotFoundError(error_msg)
+                        else:
+                            error_msg = "No CA certificate path configured, cannot verify server certificate"
+                            print(f"[TLS Config] ✗ ERROR: {error_msg}")
+                            logger.error(f"[TLS Config] {error_msg}")
+                            raise ValueError("CA certificate path is required for MQTTS connection")
+                        
+                        # Use default client certificates if available (AIToolStack always uses default client certs)
+                        default_client_cert = Path("/mosquitto/config/certs/client.crt")
+                        default_client_key = Path("/mosquitto/config/certs/client.key")
+                        if default_client_cert.exists() and default_client_key.exists():
+                            tls_kwargs["certfile"] = str(default_client_cert)
+                            tls_kwargs["keyfile"] = str(default_client_key)
+                            print(f"[TLS Config] Using default client certificates: {default_client_cert}")
+                            logger.info(f"[TLS Config] Using default client certificates: {default_client_cert}")
+                        else:
+                            print(f"[TLS Config] No client certificates found, using CA verification only (secure mode)")
+                            logger.info("[TLS Config] Using CA certificate verification (secure mode)")
+                        
+                        # AIToolStack as client should always verify server certificate
+                        use_insecure = False
+                        
+                        # Configure TLS with CA certificate verification
+                        # CRITICAL: For security, we MUST verify the server certificate using the CA
+                        # Do NOT allow insecure mode to bypass certificate verification
+                        print(f"[TLS Config] Calling tls_set with keys: {list(tls_kwargs.keys())}")
+                        print(f"[TLS Config] cert_reqs={tls_kwargs.get('cert_reqs')}, ca_certs={tls_kwargs.get('ca_certs')}")
+                        logger.info(f"[TLS Config] Calling tls_set with: {list(tls_kwargs.keys())}")
+                        logger.info(f"[TLS Config] cert_reqs={tls_kwargs.get('cert_reqs')}, ca_certs={tls_kwargs.get('ca_certs')}")
+                        try:
+                            client.tls_set(**tls_kwargs)
+                            print(f"[TLS Config] ✓ tls_set() completed successfully")
+                            logger.info(f"[TLS Config] tls_set() completed successfully with CA certificate verification")
+                        except Exception as tls_err:
+                            print(f"[TLS Config] ✗ tls_set() failed: {tls_err}")
+                            logger.error(f"[TLS Config] tls_set() failed: {tls_err}", exc_info=True)
+                            raise
+                        
+                        # CRITICAL: Always disable insecure mode to enforce certificate verification
+                        # Even if user sets insecure_skip_verify, we enforce verification for built-in broker
+                        # This ensures only certificates signed by the correct CA can connect
+                        use_insecure = False  # Force secure mode for built-in broker
+                        print(f"[TLS Config] FORCING tls_insecure_set(False) to enable certificate verification")
+                        logger.info(f"[TLS Config] Setting TLS insecure mode: {use_insecure} (FORCED to False for security)")
+                        try:
+                            client.tls_insecure_set(use_insecure)
+                            print(f"[TLS Config] ✓ tls_insecure_set(False) completed successfully")
+                            print(f"[TLS Config] ✓ Certificate verification is ENABLED - only certificates signed by CA will be accepted")
+                            logger.info(f"[TLS Config] tls_insecure_set({use_insecure}) completed successfully")
+                            logger.info(f"[TLS Config] Certificate verification is ENABLED - only certificates signed by CA will be accepted")
+                        except Exception as tls_err:
+                            print(f"[TLS Config] ✗ tls_insecure_set() failed: {tls_err}")
+                            logger.error(f"[TLS Config] tls_insecure_set() failed: {tls_err}", exc_info=True)
+                            raise
+                        print(f"[TLS Config] ===== TLS configuration completed =====")
+                        # Double-check: Verify TLS settings are correct before connecting
+                        # Note: paho-mqtt doesn't provide getters, so we can't verify the actual state
+                        # But we log what we expect to ensure the code path is correct
+                        print(f"[TLS Config] FINAL STATE: cert_reqs=CERT_REQUIRED({ssl.CERT_REQUIRED}), ca_certs={tls_kwargs.get('ca_certs')}, insecure=False")
+                    else:
+                        logger.info(f"[TLS Config] Protocol is '{protocol}', skipping TLS configuration")
+                else:
+                    # External broker configuration (from database or legacy config)
+                    protocol = ep.get("protocol", cfg.external_protocol)
+                    keepalive = ep.get("keepalive", cfg.external_keepalive or 120)
+                    # All external brokers use default topic pattern based on system business logic
+                    topic_pattern = None  # Will use default from settings.MQTT_UPLOAD_TOPIC
+                    # External broker authentication
+                    username = ep.get("username") or cfg.external_username
+                    password = ep.get("password") or cfg.external_password
+                    if username and password:
+                        client.username_pw_set(username, password)
+
+                    # TLS configuration for external broker
+                    tls_enabled = ep.get("tls_enabled", False) or (protocol == "mqtts" and cfg.external_tls_enabled)
+                    if protocol == "mqtts" and tls_enabled:
+                        tls_kwargs = {}
+                        tls_ca_cert = ep.get("tls_ca_cert_path") or cfg.external_tls_ca_cert_path
+                        tls_client_cert = ep.get("tls_client_cert_path") or cfg.external_tls_client_cert_path
+                        tls_client_key = ep.get("tls_client_key_path") or cfg.external_tls_client_key_path
+                        
+                        if tls_ca_cert:
+                            tls_kwargs["ca_certs"] = tls_ca_cert
+                        if tls_client_cert and tls_client_key:
+                            tls_kwargs["certfile"] = tls_client_cert
+                            tls_kwargs["keyfile"] = tls_client_key
+
+                        # Use TLS v1.2 as a safe default
+                        tls_kwargs["tls_version"] = ssl.PROTOCOL_TLSv1_2
+
+                        if tls_kwargs:
+                            client.tls_set(**tls_kwargs)
+                        # AIToolStack as client should always verify server certificate
+                        # tls_insecure_skip_verify is not applicable for external brokers
+                        client.tls_insecure_set(False)
+
+                # Store topic pattern for this client (use default if None)
+                # All brokers subscribe to the same default topic pattern based on system business logic
+                setattr(client, "_camthink_topic_pattern", topic_pattern or settings.MQTT_UPLOAD_TOPIC)
+
+                # For builtin broker with MQTTS, verify TLS settings one more time before connecting
+                if ep["type"] == "builtin" and protocol == "mqtts":
+                    print(f"[MQTT Service] Pre-connect verification: Protocol=mqtts, expecting certificate verification")
+                    # Ensure insecure mode is still False (in case it was changed elsewhere)
+                    client.tls_insecure_set(False)
+                    print(f"[MQTT Service] Re-confirmed: tls_insecure_set(False) before connect")
+                
+                print(f"[MQTT Service] Connecting to {ep['type']} MQTT Broker (protocol: {protocol}) at {ep['host']}:{ep['port']}")
+                logger.info(f"[MQTT Service] Connecting to {ep['type']} MQTT Broker (protocol: {protocol}) at {ep['host']}:{ep['port']}")
+                try:
+                    client.connect(ep["host"], ep["port"], keepalive=keepalive)
+                    print(f"[MQTT Service] ✓ connect() call completed for {ep['type']} broker")
+                    logger.info(f"[MQTT Service] connect() call completed, starting loop for {ep['type']} broker")
+                    client.loop_start()
+                    print(f"[MQTT Service] ✓ loop_start() completed for {ep['type']} broker")
+                    logger.info(f"[MQTT Service] loop_start() completed for {ep['type']} broker")
+                except Exception as conn_err:
+                    print(f"[MQTT Service] ✗ Error during connect/loop_start for {ep['type']} broker: {conn_err}")
+                    logger.error(f"[MQTT Service] Error during connect/loop_start for {ep['type']} broker: {conn_err}", exc_info=True)
+                    raise
+
+                # Save clients for later stop / status
+                if self.client is None:
+                    self.client = client
+                self.clients.append(client)
+
+            logger.info("MQTT client(s) loop started")
         except ConnectionRefusedError:
             error_msg = "Connection refused"
-            if settings.MQTT_USE_BUILTIN_BROKER:
+            if self._config and self._config.mode == "builtin":
                 error_msg += ". Built-in broker may not be running."
             else:
-                error_msg += f". Please check if MQTT broker is running at {settings.MQTT_BROKER}:{settings.MQTT_PORT}"
+                error_msg += f". Please check if MQTT broker is running at {self.broker_host}:{self.broker_port}"
             logger.error(error_msg)
             self.is_connected = False
-            self.recent_errors.append({
-                'time': time.time(),
-                'type': 'connection_refused',
-                'code': None,
-                'message': error_msg
-            })
+            self.recent_errors.append(
+                {
+                    "time": time.time(),
+                    "type": "connection_refused",
+                    "code": None,
+                    "message": error_msg,
+                }
+            )
         except Exception as e:
             logger.error(f"Failed to connect: {e}", exc_info=True)
             self.is_connected = False
-            self.recent_errors.append({
-                'time': time.time(),
-                'type': 'connection_error',
-                'code': None,
-                'message': str(e)
-            })
+            self.recent_errors.append(
+                {
+                    "time": time.time(),
+                    "type": "connection_error",
+                    "code": None,
+                    "message": str(e),
+                }
+            )
     
     def stop(self):
         """Stop MQTT client"""
-        if self.client:
-            logger.info("Stopping MQTT client...")
-            try:
-                self.client.loop_stop()
-                self.client.disconnect()
-                self.is_connected = False
-                logger.info("MQTT client stopped")
-            except Exception as e:
-                logger.error(f"Error stopping MQTT client: {e}")
+        logger.info("Stopping MQTT client(s)...")
+        try:
+            # Stop all managed clients
+            for client in self.clients or ([] if self.client is None else [self.client]):
+                try:
+                    client.loop_stop()
+                    client.disconnect()
+                except Exception as e:
+                    logger.error(f"Error stopping MQTT client: {e}")
+            self.clients = []
+            self.client = None
+            self.is_connected = False
+            logger.info("MQTT client(s) stopped")
+        except Exception as e:
+            logger.error(f"Error stopping MQTT clients: {e}")
+
+    def reload_and_reconnect(self):
+        """Reload configuration from DB and reconnect to broker."""
+        self.stop()
+        self.start()
 
 
 # Global MQTT service instance

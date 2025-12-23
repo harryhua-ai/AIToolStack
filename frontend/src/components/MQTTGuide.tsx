@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { IoChevronDown, IoChevronUp, IoInformationCircleOutline, IoCheckmarkCircle, IoCloseCircle, IoCopyOutline, IoRefresh } from 'react-icons/io5';
+import { IoChevronDown, IoChevronUp, IoInformationCircleOutline, IoCheckmarkCircle, IoCloseCircle, IoCopyOutline, IoRefresh, IoOpenOutline } from 'react-icons/io5';
 import { API_BASE_URL } from '../config';
 import './MQTTGuide.css';
 import { Button } from '../ui/Button';
@@ -25,6 +25,21 @@ interface MQTTStatus {
   topic?: string;
   server_ip?: string;  // Server IP address
   server_port?: number;  // Server port
+  builtin?: {
+    enabled: boolean;
+    host: string | null;
+    port: number | null;
+    protocol: 'mqtt' | 'mqtts';
+    connected: boolean;
+  };
+  external?: {
+    enabled: boolean;
+    configured: boolean;
+    host: string | null;
+    port: number | null;
+    protocol: 'mqtt' | 'mqtts';
+    connected: boolean;
+  };
 }
 
 interface TestResult {
@@ -126,8 +141,8 @@ export const MQTTGuide: React.FC<MQTTGuideProps> = ({ projectId, projectName }) 
           <Icon component={IoInformationCircleOutline} />
           <span className="mqtt-guide-title">{t('mqtt.title')}</span>
           {mqttStatus && (
-            <span className={`mqtt-status-badge ${mqttStatus.connected ? 'connected' : 'disconnected'}`}>
-              {mqttStatus.connected ? (
+            <span className={`mqtt-status-badge ${(mqttStatus.builtin?.connected || mqttStatus.external?.connected) ? 'connected' : 'disconnected'}`}>
+              {(mqttStatus.builtin?.connected || mqttStatus.external?.connected) ? (
                 <>
                   <Icon component={IoCheckmarkCircle} />
                   {t('mqtt.connected')}
@@ -158,15 +173,20 @@ export const MQTTGuide: React.FC<MQTTGuideProps> = ({ projectId, projectName }) 
           ) : (
             <>
               <div className="mqtt-info-section">
-                {mqttStatus?.use_builtin ? (
+                {mqttStatus?.builtin?.enabled && mqttStatus?.builtin?.connected ? (
                   <div className="mqtt-notice success">
                     <Icon component={IoCheckmarkCircle} />
                     <p dangerouslySetInnerHTML={{ __html: t('mqtt.usingBuiltin') }} />
                   </div>
-                ) : (
+                ) : mqttStatus?.external?.enabled && mqttStatus?.external?.connected ? (
                   <div className="mqtt-notice">
                     <Icon component={IoInformationCircleOutline} />
                     <p dangerouslySetInnerHTML={{ __html: t('mqtt.usingExternal') }} />
+                  </div>
+                ) : (
+                  <div className="mqtt-notice warning">
+                    <Icon component={IoInformationCircleOutline} />
+                    <p dangerouslySetInnerHTML={{ __html: t('mqtt.brokerNotConfigured') }} />
                   </div>
                 )}
                 <h4>{t('mqtt.projectInfo')}</h4>
@@ -229,19 +249,67 @@ export const MQTTGuide: React.FC<MQTTGuideProps> = ({ projectId, projectName }) 
                     </Button>
                   </div>
                 </div>
-                {mqttStatus?.broker && (
+                {(mqttStatus?.builtin?.enabled || mqttStatus?.external?.enabled) && (
                   <div className="info-item">
                     <span className="info-label">{t('mqtt.mqttBroker')}</span>
                     <div className="info-value-group">
-                      <code className="info-value">{mqttStatus.broker}:{mqttStatus.port}</code>
-                      {mqttStatus.broker_type && (
-                        <span className={`broker-type-badge ${mqttStatus.broker_type}`}>
-                          {mqttStatus.broker_type === 'builtin' ? t('mqtt.builtin') : t('mqtt.external')}
-                        </span>
+                      {mqttStatus?.builtin?.enabled && (
+                        <div style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <code className="info-value" style={{ flex: '0 1 auto', wordBreak: 'break-all' }}>
+                            {mqttStatus.builtin.protocol}://{mqttStatus.builtin.host || mqttStatus?.server_ip || 'localhost'}:{mqttStatus.builtin.port || 1883}
+                          </code>
+                          {mqttStatus.builtin.connected && (
+                            <span className="mqtt-status-badge connected" style={{ flexShrink: 0 }}>
+                              {t('mqtt.connected')}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {mqttStatus?.external?.enabled && mqttStatus?.external?.configured && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <code className="info-value" style={{ flex: '0 1 auto', wordBreak: 'break-all' }}>
+                            {mqttStatus.external.protocol}://{mqttStatus.external.host || mqttStatus?.server_ip || 'localhost'}:{mqttStatus.external.port || 1883}
+                          </code>
+                          <span className={`broker-type-badge external`} style={{ flexShrink: 0 }}>
+                            {t('mqtt.external')}
+                          </span>
+                          {mqttStatus.external.connected && (
+                            <span className="mqtt-status-badge connected" style={{ flexShrink: 0 }}>
+                              {t('mqtt.connected')}
+                            </span>
+                          )}
+                        </div>
                       )}
                     </div>
                   </div>
                 )}
+                <div className="info-item" style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border-color)' }}>
+                  <div className="mqtt-notice info" style={{ marginBottom: '8px', display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                    <Icon component={IoInformationCircleOutline} />
+                    <div style={{ flex: 1 }}>
+                      <p dangerouslySetInnerHTML={{ __html: t('mqtt.configHint') }} style={{ margin: 0, marginBottom: '8px' }} />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          // Dispatch custom event to navigate to settings
+                          window.dispatchEvent(new CustomEvent('navigate-to-settings'));
+                        }}
+                        style={{ marginTop: '4px' }}
+                      >
+                        <Icon component={IoOpenOutline} />
+                        {t('mqtt.openSystemSettings')}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <div className="info-item">
+                  <div className="mqtt-notice info" style={{ marginBottom: '8px' }}>
+                    <Icon component={IoInformationCircleOutline} />
+                    <p dangerouslySetInnerHTML={{ __html: t('mqtt.deviceAccessHint', { server: `${mqttStatus?.server_ip || 'localhost'}:${mqttStatus?.server_port || 8000}` }) }} />
+                  </div>
+                </div>
                 
                 <div className="mqtt-test-section">
                   <Button
@@ -266,65 +334,39 @@ export const MQTTGuide: React.FC<MQTTGuideProps> = ({ projectId, projectName }) 
                           <strong>{t('mqtt.solution')}</strong>
                           {testResult.error_code === 61 || testResult.error_code === 111 ? (
                             <div className="suggestion-steps">
-                              {mqttStatus?.use_builtin ? (
-                                <p><strong>{t('mqtt.builtinStartFailed')}</strong></p>
+                              <p><strong>{t('mqtt.brokerConnectionFailed')}</strong></p>
+                              <p>{t('mqtt.configInSystemSettings')}</p>
+                              {mqttStatus?.builtin?.enabled ? (
+                                <div className="code-snippet">
+                                  <div className="code-snippet-header">{t('mqtt.builtinBrokerTroubleshooting')}</div>
+                                  <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                                    <li>{t('mqtt.troubleshooting.checkBuiltinEnabled')}</li>
+                                    <li>{t('mqtt.troubleshooting.checkBuiltinPort', { port: mqttStatus?.builtin?.port || 1883 })}</li>
+                                    <li>{t('mqtt.troubleshooting.checkBuiltinTLS')}</li>
+                                    <li>{t('mqtt.troubleshooting.checkBuiltinAuth')}</li>
+                                  </ul>
+                                </div>
                               ) : (
-                                <p><strong>{t('mqtt.externalRequired')}</strong></p>
+                                <div className="code-snippet">
+                                  <div className="code-snippet-header">{t('mqtt.externalBrokerTroubleshooting')}</div>
+                                  <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                                    <li>{t('mqtt.troubleshooting.checkExternalConfigured')}</li>
+                                    <li>{t('mqtt.troubleshooting.checkExternalAddress')}</li>
+                                    <li>{t('mqtt.troubleshooting.checkExternalPort', { port: mqttStatus?.external?.port || 1883 })}</li>
+                                    <li>{t('mqtt.troubleshooting.checkExternalAuth')}</li>
+                                    <li>{t('mqtt.troubleshooting.checkExternalTLS')}</li>
+                                  </ul>
+                                </div>
                               )}
-                              <div className="code-snippet">
-                                <div className="code-snippet-header">{t('mqtt.macOSHomebrew')}</div>
-                                <pre><code>{`${t('mqtt.installMosquitto')}
-brew install mosquitto
-
-${t('mqtt.startMosquitto')}
-brew services start mosquitto
-
-${t('mqtt.runMosquitto')}
-mosquitto -c /opt/homebrew/etc/mosquitto/mosquitto.conf
-
-${t('mqtt.verifyBroker')}
-mosquitto_sub -h localhost -t test`}</code></pre>
-                              </div>
-                              <div className="code-snippet">
-                                <div className="code-snippet-header">{t('mqtt.dockerEasiest')}</div>
-                                <pre><code>{`${t('mqtt.runMosquittoDocker')}
-docker run -it -p 1883:1883 -p 9001:9001 \\
-  eclipse-mosquitto
-
-${t('mqtt.runMosquittoDockerBg')}
-docker run -d --name mosquitto \\
-  -p 1883:1883 -p 9001:9001 \\
-  eclipse-mosquitto`}</code></pre>
-                              </div>
-                              <div className="code-snippet">
-                                <div className="code-snippet-header">{t('mqtt.linuxUbuntu')}</div>
-                                <pre><code>{`${t('mqtt.install')}
-sudo apt-get update
-sudo apt-get install mosquitto mosquitto-clients
-
-${t('mqtt.startService')}
-sudo systemctl start mosquitto
-sudo systemctl enable mosquitto
-
-${t('mqtt.checkStatus')}
-sudo systemctl status mosquitto`}</code></pre>
-                              </div>
-                              <div className="code-snippet">
-                                <div className="code-snippet-header">{t('mqtt.verifyConnection')}</div>
-                                <pre><code>{`${t('mqtt.subscribeTest')}
-mosquitto_sub -h localhost -t test
-
-${t('mqtt.publishTest')}
-mosquitto_pub -h localhost -t test -m "Hello MQTT"`}</code></pre>
-                              </div>
                             </div>
                           ) : (
                             <ul>
                               <li>{t('mqtt.troubleshooting.ensureRunning')}</li>
+                              <li>{t('mqtt.troubleshooting.checkSystemSettings')}</li>
                               <li>{t('mqtt.troubleshooting.checkAddress')}</li>
-                              <li>{t('mqtt.troubleshooting.checkFirewall', { port: mqttStatus?.port || 1883 })}</li>
-                              <li>{t('mqtt.troubleshooting.checkDocker')}</li>
+                              <li>{t('mqtt.troubleshooting.checkFirewall', { port: mqttStatus?.builtin?.port || mqttStatus?.external?.port || 1883 })}</li>
                               <li>{t('mqtt.troubleshooting.checkAuth')}</li>
+                              <li>{t('mqtt.troubleshooting.checkTLS')}</li>
                             </ul>
                           )}
                         </div>
@@ -337,7 +379,8 @@ mosquitto_pub -h localhost -t test -m "Hello MQTT"`}</code></pre>
               <div className="mqtt-usage-section">
                 <h4>{t('mqtt.usage.title')}</h4>
                 <ol className="usage-steps">
-                  <li>{t('mqtt.usage.connect')} <code>{mqttStatus?.broker || mqttStatus?.server_ip || 'localhost'}:{mqttStatus?.port || 1883}</code></li>
+                  <li>{t('mqtt.usage.getBootstrap')} <code>{mqttStatus?.server_ip || 'localhost'}:{mqttStatus?.server_port || 8000}/api/device/bootstrap</code></li>
+                  <li>{t('mqtt.usage.connect')} <code>{mqttStatus?.builtin?.enabled ? `${mqttStatus.builtin.protocol}://${mqttStatus.builtin.host || mqttStatus?.server_ip || 'localhost'}:${mqttStatus.builtin.port || 1883}` : (mqttStatus?.external?.enabled ? `${mqttStatus.external.protocol}://${mqttStatus.external.host || mqttStatus?.server_ip || 'localhost'}:${mqttStatus.external.port || 1883}` : `${mqttStatus?.server_ip || 'localhost'}:1883`)}</code></li>
                   <li>{t('mqtt.usage.publish')} <code>{mqttTopic}</code></li>
                   <li>{t('mqtt.usage.format')}</li>
                   <li>{t('mqtt.usage.autoSave')}</li>

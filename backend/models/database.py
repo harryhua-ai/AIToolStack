@@ -143,9 +143,163 @@ class TrainingLog(Base):
     training_record = relationship("TrainingRecord")
 
 
+class ExternalMQTTBroker(Base):
+    """External MQTT Broker configuration table (supports multiple brokers)"""
+    __tablename__ = "external_mqtt_brokers"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)  # User-friendly name for the broker
+    enabled = Column(Boolean, default=True, nullable=False)
+    protocol = Column(String, default="mqtt", nullable=False)  # mqtt / mqtts
+    host = Column(String, nullable=False)
+    port = Column(Integer, nullable=False)
+    username = Column(String, nullable=True)
+    password = Column(String, nullable=True)
+    qos = Column(Integer, default=1, nullable=False)
+    keepalive = Column(Integer, default=120, nullable=False)
+    tls_enabled = Column(Boolean, default=False, nullable=False)
+    tls_ca_cert_path = Column(Text, nullable=True)
+    tls_client_cert_path = Column(Text, nullable=True)
+    tls_client_key_path = Column(Text, nullable=True)
+    tls_insecure_skip_verify = Column(Boolean, default=False, nullable=False)
+    # Topic subscription pattern (e.g., "annotator/upload/+" or "device/+/image")
+    topic_pattern = Column(String, nullable=True)  # If None, uses default from settings
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MQTTSettings(Base):
+    """MQTT settings table (single-row configuration)"""
+    __tablename__ = "mqtt_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Core switches
+    enabled = Column(Boolean, default=True, nullable=False)
+    # Historical field: was used for builtin/external mode selection; kept for
+    # backward compatibility but no longer drives runtime behaviour directly.
+    mode = Column(String, default="builtin", nullable=False)
+    # Whether to actively connect to external MQTT Broker in addition to the
+    # built-in broker. Built-in broker is considered available by default when
+    # MQTT is enabled.
+    external_enabled = Column(Boolean, default=False, nullable=False)
+
+    # Built-in broker configuration
+    builtin_protocol = Column(String, default="mqtt", nullable=False)  # mqtt / mqtts
+    builtin_broker_host = Column(String, nullable=True)  # Manual override for broker host IP (if None, auto-detect)
+    builtin_tcp_port = Column(Integer, nullable=True)
+    builtin_tls_port = Column(Integer, nullable=True)
+    builtin_allow_anonymous = Column(Boolean, default=True, nullable=False)
+    builtin_username = Column(String, nullable=True)  # Username for authentication when anonymous is disabled
+    builtin_password = Column(String, nullable=True)  # Password for authentication when anonymous is disabled
+    builtin_max_connections = Column(Integer, default=100, nullable=False)
+    builtin_keepalive_timeout = Column(Integer, default=300, nullable=False)  # Broker-side timeout for disconnecting unresponsive clients
+    builtin_qos = Column(Integer, default=1, nullable=False)  # Client-side QoS (used by mqtt_service when connecting as client, not broker config)
+    builtin_keepalive = Column(Integer, default=120, nullable=False)  # Client-side keepalive (used by mqtt_service when connecting as client, not broker config)
+    builtin_tls_enabled = Column(Boolean, default=False, nullable=False)
+    builtin_tls_ca_cert_path = Column(Text, nullable=True)
+    builtin_tls_client_cert_path = Column(Text, nullable=True)
+    builtin_tls_client_key_path = Column(Text, nullable=True)
+    builtin_tls_insecure_skip_verify = Column(Boolean, default=False, nullable=False)
+    builtin_tls_require_client_cert = Column(Boolean, default=False, nullable=False)  # Whether to require client certificates (mTLS)
+
+    # External broker configuration
+    external_protocol = Column(String, default="mqtt", nullable=False)  # mqtt / mqtts
+    external_host = Column(String, nullable=True)
+    external_port = Column(Integer, nullable=True)
+    external_username = Column(String, nullable=True)
+    external_password = Column(String, nullable=True)
+    external_qos = Column(Integer, default=1, nullable=False)
+    external_keepalive = Column(Integer, default=120, nullable=False)
+    external_tls_enabled = Column(Boolean, default=False, nullable=False)
+    external_tls_ca_cert_path = Column(Text, nullable=True)
+    external_tls_client_cert_path = Column(Text, nullable=True)
+    external_tls_client_key_path = Column(Text, nullable=True)
+    external_tls_insecure_skip_verify = Column(Boolean, default=False, nullable=False)
+
+    # Legacy fields (kept for backward compatibility, will be migrated gradually)
+    protocol = Column(String, default="mqtt", nullable=False)  # Deprecated: use builtin_protocol/external_protocol
+    host = Column(String, nullable=True)  # Deprecated: use external_host
+    port = Column(Integer, nullable=True)  # Deprecated: use external_port
+    username = Column(String, nullable=True)  # Deprecated: use external_username
+    password = Column(String, nullable=True)  # Deprecated: use external_password
+    qos = Column(Integer, default=1, nullable=False)  # Deprecated: use builtin_qos/external_qos
+    keepalive = Column(Integer, default=120, nullable=False)  # Deprecated: use builtin_keepalive/external_keepalive
+    tls_enabled = Column(Boolean, default=False, nullable=False)  # Deprecated: use builtin_tls_enabled/external_tls_enabled
+    tls_ca_cert_path = Column(Text, nullable=True)  # Deprecated: use builtin_tls_*/external_tls_*
+    tls_client_cert_path = Column(Text, nullable=True)  # Deprecated
+    tls_client_key_path = Column(Text, nullable=True)  # Deprecated
+    tls_insecure_skip_verify = Column(Boolean, default=False, nullable=False)  # Deprecated
+
+
+def migrate_mqtt_settings():
+    """Migrate mqtt_settings table to add new columns if they don't exist"""
+    from sqlalchemy import inspect, text
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    inspector = inspect(engine)
+    if not inspector.has_table("mqtt_settings"):
+        logger.info("[DB Migration] mqtt_settings table does not exist, will be created by create_all")
+        return  # Table doesn't exist yet, will be created by create_all
+    
+    existing_columns = {col['name'] for col in inspector.get_columns("mqtt_settings")}
+    logger.info(f"[DB Migration] Existing mqtt_settings columns: {sorted(existing_columns)}")
+    
+    # Define new columns to add (SQLite compatible syntax)
+    # Note: SQLite doesn't have native BOOLEAN, uses INTEGER (0/1)
+    new_columns = {
+        'external_enabled': 'INTEGER DEFAULT 0',
+        'builtin_protocol': 'VARCHAR(10) DEFAULT "mqtt"',
+        'builtin_broker_host': 'VARCHAR(255)',
+        'builtin_qos': 'INTEGER DEFAULT 1',
+        'builtin_keepalive': 'INTEGER DEFAULT 120',
+        'builtin_tls_enabled': 'INTEGER DEFAULT 0',
+        'builtin_tls_ca_cert_path': 'TEXT',
+        'builtin_tls_client_cert_path': 'TEXT',
+        'builtin_tls_client_key_path': 'TEXT',
+        'builtin_tls_insecure_skip_verify': 'INTEGER DEFAULT 0',
+        'builtin_tls_require_client_cert': 'INTEGER DEFAULT 0',
+        'builtin_username': 'VARCHAR(255)',
+        'builtin_password': 'VARCHAR(255)',
+        'external_protocol': 'VARCHAR(10) DEFAULT "mqtt"',
+        'external_host': 'VARCHAR(255)',
+        'external_port': 'INTEGER',
+        'external_username': 'VARCHAR(255)',
+        'external_password': 'VARCHAR(255)',
+        'external_qos': 'INTEGER DEFAULT 1',
+        'external_keepalive': 'INTEGER DEFAULT 120',
+        'external_tls_enabled': 'INTEGER DEFAULT 0',
+        'external_tls_ca_cert_path': 'TEXT',
+        'external_tls_client_cert_path': 'TEXT',
+        'external_tls_client_key_path': 'TEXT',
+        'external_tls_insecure_skip_verify': 'INTEGER DEFAULT 0',
+    }
+    
+    columns_added = []
+    with engine.begin() as conn:  # Use begin() for automatic transaction management
+        for col_name, col_def in new_columns.items():
+            if col_name not in existing_columns:
+                try:
+                    conn.execute(text(f'ALTER TABLE mqtt_settings ADD COLUMN {col_name} {col_def}'))
+                    columns_added.append(col_name)
+                    logger.info(f"[DB Migration] Added column: {col_name}")
+                except Exception as e:
+                    # Column might already exist or other error
+                    logger.warning(f"[DB Migration] Could not add column {col_name}: {e}")
+    
+    if columns_added:
+        logger.info(f"[DB Migration] Successfully added {len(columns_added)} new columns to mqtt_settings table")
+    else:
+        logger.info("[DB Migration] No new columns needed for mqtt_settings table")
+
+
 def init_db():
     """Initialize database, create all tables"""
     Base.metadata.create_all(bind=engine)
+    # Run migration for existing tables
+    migrate_mqtt_settings()
 
 
 def get_db():

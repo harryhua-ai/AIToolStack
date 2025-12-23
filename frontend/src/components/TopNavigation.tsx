@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { LanguageSwitcher } from './LanguageSwitcher';
-import { IoHome, IoPricetag, IoCube } from 'react-icons/io5';
+import { IoHome, IoPricetag, IoCube, IoSettings } from 'react-icons/io5';
 import './TopNavigation.css';
 
 // Icon component wrapper
@@ -9,7 +9,7 @@ const Icon: React.FC<{ component: React.ComponentType<any> }> = ({ component: Co
   return <Component />;
 };
 
-type MenuItem = 'dashboard' | 'projects' | 'models';
+type MenuItem = 'dashboard' | 'projects' | 'models' | 'settings';
 
 interface TopNavigationProps {
   activeMenu: MenuItem;
@@ -47,6 +47,13 @@ export const TopNavigation: React.FC<TopNavigationProps> = ({ activeMenu, onMenu
         </div>
         <div className="nav-right">
           <LanguageSwitcher />
+          <button
+            className={`nav-settings-btn ${activeMenu === 'settings' ? 'active' : ''}`}
+            onClick={() => onMenuChange('settings')}
+            title={t('nav.settings', '系统设置')}
+          >
+            <Icon component={IoSettings} />
+          </button>
         </div>
       </div>
     </div>

@@ -22,7 +22,7 @@ export const Select: React.FC<SelectProps> = ({
 }) => {
   return (
     <RadixSelect.Root value={value} onValueChange={onValueChange} disabled={disabled}>
-      <RadixSelect.Trigger className={['input-base select-trigger', className].filter(Boolean).join(' ')}>
+      <RadixSelect.Trigger className={['input-base input-md select-trigger', className].filter(Boolean).join(' ')}>
         <RadixSelect.Value placeholder={placeholder} />
         <RadixSelect.Icon className="select-icon">
           <IoChevronDown size={16} />

@@ -69,7 +69,9 @@
   display: flex;
   justify-content: flex-end;
   gap: var(--spacing-md);
-  margin-top: var(--spacing-lg);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-top: 1px solid var(--border-color);
+  margin-top: 0; /* Remove default margin, use padding instead */
 }
 
 .ui-form-stack {

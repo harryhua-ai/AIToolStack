@@ -40,7 +40,8 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (including git for cloning NE301 project, and Docker CLI for compiling NE301 models)
+# Install runtime dependencies (including git for cloning NE301 project, Docker CLI for compiling NE301 models,
+# and mosquitto/mosquitto-clients for managing and testing MQTT)
 RUN apt-get update && apt-get install -y \
     libgomp1 \
     curl \
@@ -54,6 +55,8 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender-dev \
     libgthread-2.0-0 \
+    mosquitto \
+    mosquitto-clients \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates
 

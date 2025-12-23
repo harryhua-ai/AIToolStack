@@ -4,6 +4,7 @@ import { Dashboard } from './components/Dashboard';
 import { ProjectSelector } from './components/ProjectSelector';
 import { AnnotationWorkbench } from './components/AnnotationWorkbench';
 import { TrainingPanel } from './components/TrainingPanel';
+import { SystemSettings } from './components/SystemSettings';
 import { API_BASE_URL } from './config';
 import './App.css';
 
@@ -15,7 +16,7 @@ interface Project {
   updated_at?: string;
 }
 
-type MenuItem = 'dashboard' | 'projects' | 'models';
+type MenuItem = 'dashboard' | 'projects' | 'models' | 'settings';
 
 function App() {
   const [activeMenu, setActiveMenu] = useState<MenuItem>('dashboard');
@@ -28,6 +29,20 @@ function App() {
   useEffect(() => {
     // Load project list
     fetchProjects();
+    
+    // Listen for navigation events from MQTTGuide
+    const handleNavigateToSettings = () => {
+      setActiveMenu('settings');
+      setSelectedProject(null);
+      setShowTrainingPanel(false);
+      setTrainingProjectId(null);
+      setTrainingInitialId(null);
+    };
+    
+    window.addEventListener('navigate-to-settings', handleNavigateToSettings);
+    return () => {
+      window.removeEventListener('navigate-to-settings', handleNavigateToSettings);
+    };
   }, []);
 
   const fetchProjects = async () => {
@@ -130,6 +145,9 @@ function App() {
             onOpenTraining={handleOpenTrainingPanel}
           />
         );
+
+      case 'settings':
+        return <SystemSettings />;
 
       default:
         return null;
