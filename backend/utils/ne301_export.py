@@ -1052,7 +1052,7 @@ def _build_with_docker(
         
         return model_bin
             
-    except subprocess.TimeoutError:
+    except subprocess.TimeoutExpired:
         logger.error("[NE301] Docker build timeout")
         print("[NE301] Docker build timeout")
         raise RuntimeError("NE301 model compilation timeout (exceeded 10 minutes)")

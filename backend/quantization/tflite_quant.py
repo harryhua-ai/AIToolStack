@@ -55,10 +55,15 @@ def main(cfg: DictConfig) -> None:
         else:
             representative_ds_path = cfg.quantization.calib_dataset_path
             list_of_files = os.listdir(representative_ds_path)
+            print(f"DEBUG: Found {len(list_of_files)} files in {representative_ds_path}")
 
+            valid_extensions = ('.jpg', '.jpeg', '.png')
+            samples_yielded = 0
             for image_file in tqdm.tqdm(list_of_files):
-                if image_file.endswith(".jpg"):
+                if image_file.lower().endswith(valid_extensions):
                     image = cv2.imread(os.path.join(representative_ds_path, image_file))
+                    if image is None:
+                        continue
                     if len(image.shape) != 3:
                         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -76,7 +81,9 @@ def main(cfg: DictConfig) -> None:
                     )
                     img = image_data.astype(np.float32)
                     image_processed = np.expand_dims(img, 0)
+                    samples_yielded += 1
                     yield [image_processed]
+            print(f"DEBUG: representative_data_gen yielded {samples_yielded} samples")
 
     configs = get_config(cfg)
 
@@ -117,9 +124,21 @@ def main(cfg: DictConfig) -> None:
 
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_data_gen
-
+    
+    # Enforce full integer quantization
+    print(f"DEBUG: Setting up TFLITE_BUILTINS_INT8")
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.target_spec.supported_types = [tf.int8]
+    converter.experimental_new_converter = True
+    
     # Quantize and save
-    tflite_model_quantio = converter.convert()
+    print(f"DEBUG: Starting converter.convert()... This may take a few minutes.")
+    try:
+        tflite_model_quantio = converter.convert()
+        print(f"DEBUG: converter.convert() successful. Size: {len(tflite_model_quantio)} bytes")
+    except Exception as e:
+        print(f"DEBUG: converter.convert() FAILED: {e}")
+        raise e
     tflite_model_quantio_file = (
         tflite_models_dir
         / f"{name}_{quant_tag}_{input_tag}{output_tag}_{uc}.tflite"

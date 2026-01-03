@@ -1890,12 +1890,52 @@ def export_tflite_model(
             if not saved_model_dir.exists():
                 raise HTTPException(status_code=500, detail="SavedModel directory not found, cannot perform NE301 quantization")
 
-            # Calibration set defaults to exported YOLO dataset val (fallback to train if not exists)
-            calib_dir = settings.DATASETS_ROOT / project_id / "yolo_export" / "images" / "val"
-            if not calib_dir.exists():
-                calib_dir = settings.DATASETS_ROOT / project_id / "yolo_export" / "images" / "train"
-            if not calib_dir.exists():
-                raise HTTPException(status_code=400, detail="Calibration set does not exist, cannot perform NE301 quantization, please export dataset first")
+            # Step 0: Find images for calibration
+            print(f"DEBUG: [training_export] Searching for images for project {project_id}")
+            calib_images = []
+            project_root = settings.DATASETS_ROOT / project_id
+            img_search_paths = [
+                project_root / "images" / "val",
+                project_root / "images" / "train",
+                project_root / "images",
+                project_root / "yolo_export" / "images" / "val",
+                project_root / "yolo_export" / "images" / "train",
+                project_root / "yolo_export" / "images",
+                project_root / "raw",
+            ]
+            
+            valid_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+            for search_path in img_search_paths:
+                if search_path.exists():
+                    print(f"DEBUG: [training_export] Checking {search_path}")
+                    found = [f for f in search_path.glob("*") if f.suffix.lower() in ('.jpg', '.jpeg', '.png')]
+                    print(f"DEBUG: [training_export] Found {len(found)} candidate images in {search_path}")
+                    calib_images.extend(found)
+                    if len(calib_images) >= 50:
+                        break
+            
+            # Create a temporary calibration directory
+            temp_calib_dir = export_path.parent / "calib_data"
+            temp_calib_dir.mkdir(parents=True, exist_ok=True)
+            
+            if calib_images:
+                from PIL import Image as PILImage
+                import random
+                sample_size = min(len(calib_images), 20)
+                selected_samples = random.sample(calib_images, sample_size)
+                for i, img_path in enumerate(selected_samples):
+                    try:
+                        with PILImage.open(img_path) as img:
+                            img = img.resize((imgsz, imgsz))
+                            img.save(temp_calib_dir / f"calib_{i:03d}.jpg")
+                    except Exception as e:
+                        print(f"DEBUG: [training_export] Failed to process {img_path}: {e}")
+                print(f"DEBUG: [training_export] Prepared {len(list(temp_calib_dir.glob('*.jpg')))} images in {temp_calib_dir}")
+            else:
+                print("DEBUG: [training_export] NO CALIBRATION IMAGES FOUND! Using fallback/random data if script permits.")
+
+            # Set calib_dir to our temporary prepared directory
+            calib_dir = temp_calib_dir
 
             quant_workdir = saved_model_dir.parent / "ne301_quant"
             quant_workdir.mkdir(parents=True, exist_ok=True)
@@ -1914,7 +1954,7 @@ def export_tflite_model(
                     "input_shape": [imgsz, imgsz, 3],
                 },
                 "quantization": {
-                    "fake": False,
+                    "fake": False if calib_images else True,
                     "quantization_type": "per_channel",
                     "quantization_input_type": "uint8",
                     "quantization_output_type": "int8",
@@ -1946,15 +1986,18 @@ def export_tflite_model(
                 text=True,
                 env=env,
             )
+            # Always print output for debugging
+            if proc.stdout:
+                print(f"[NE301] Quantization stdout:\n{proc.stdout}")
+            if proc.stderr:
+                print(f"[NE301] Quantization stderr:\n{proc.stderr}")
+
             if proc.returncode != 0:
                 logger.error(
                     "[NE301] quantization failed rc=%s stdout=%s stderr=%s",
                     proc.returncode,
                     proc.stdout,
                     proc.stderr,
-                )
-                print(
-                    f"[NE301] quantization failed rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
                 )
                 raise HTTPException(
                     status_code=500,
@@ -2856,19 +2899,91 @@ async def quantize_model_to_ne301(
     with open(data_yaml_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(data_yaml_content, f, allow_unicode=True)
     
-    # Create minimal calibration dataset (fake data for quantization)
+    # Create minimal calibration dataset (real data for quantization)
     calib_dir = temp_dir / "images" / "val"
     calib_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate a few fake calibration images (required by quantization)
+    # Try to find real images for calibration
+    real_images_found = False
     try:
-        import numpy as np
-        from PIL import Image
-        for i in range(10):  # Generate 10 fake images
-            fake_img = Image.fromarray(np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8))
-            fake_img.save(calib_dir / f"calib_{i:03d}.jpg")
+        if model_reg.project_id:
+            # Step 0: Find images for calibration
+            project_root = settings.DATASETS_ROOT / model_reg.project_id
+            print(f"DEBUG: Searching for images in {project_root}")
+            calib_images = []
+            # Try multiple common paths for images in YOLO projects
+            img_search_paths = [
+                project_root / "images" / "val",
+                project_root / "images" / "train",
+                project_root / "images",
+                project_root / "yolo_export" / "images" / "val",
+                project_root / "yolo_export" / "images" / "train",
+                project_root / "yolo_export" / "images",
+                project_root / "raw",
+            ]
+            
+            valid_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+            for search_path in img_search_paths:
+                if search_path.exists():
+                    print(f"DEBUG: Checking {search_path}")
+                    found = [f for f in search_path.glob("*") if f.suffix.lower() in ('.jpg', '.jpeg', '.png')]
+                    print(f"DEBUG: Found {len(found)} candidate images in {search_path}")
+                    calib_images.extend(found)
+                    if len(calib_images) >= 50:
+                        break
+            
+            print(f"DEBUG: Total calib images found: {len(calib_images)}")
+            
+            if not calib_images:
+                # Fallback to project's images table
+                from backend.models.database import Image
+                db_images = db.query(Image).filter(Image.project_id == model_reg.project_id).limit(50).all()
+                print(f"DEBUG: DB images found: {len(db_images)}")
+                for db_img in db_images:
+                    img_path = Path(db_img.path)
+                    if img_path.exists():
+                        calib_images.append(img_path)
+            
+            # Save a subset for calibration
+            # calib_dir = temp_dir / "images" / "val" # Already defined above
+            # calib_dir.mkdir(parents=True, exist_ok=True) # Already defined above
+            print(f"DEBUG: Saving calibration images to {calib_dir}")
+            
+            if calib_images:
+                import random
+                # Randomly pick up to 20 images
+                sample_size = min(len(calib_images), 20)
+                selected_samples = random.sample(calib_images, sample_size)
+                
+                from PIL import Image as PILImage
+                for i, img_path in enumerate(selected_samples):
+                    try:
+                        with PILImage.open(img_path) as img:
+                            img = img.resize((imgsz, imgsz))
+                            img.save(calib_dir / f"calib_{i:03d}.jpg")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to process {img_path}: {e}")
+                        logger.warning(f"Failed to process image {img_path} for calibration: {e}")
+                
+                if len(list(calib_dir.glob("*.jpg"))) > 0:
+                    real_images_found = True
+                    logger.info(f"Using {len(list(calib_dir.glob('*.jpg')))} real images for calibration")
+            else:
+                print("DEBUG: NO CALIBRATION IMAGES FOUND! Falling back to fake data (via config if possible)")
     except Exception as e:
-        logger.warning(f"Could not generate fake calibration images: {e}")
+        logger.warning(f"Error while searching for real calibration images: {e}")
+
+    # Fallback to fake data only if no real images were found
+    if not real_images_found:
+        logger.warning("No real images found for calibration, falling back to fake random data!")
+        try:
+            import numpy as np
+            from PIL import Image
+            for i in range(10):  # Generate 10 fake images
+                fake_img = Image.fromarray(np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8))
+                fake_img.save(calib_dir / f"calib_{i:03d}.jpg")
+        except Exception as e:
+            logger.error(f"Could not generate fake calibration images: {e}")
     
     try:
         # Step 1: Export to TFLite
@@ -2881,18 +2996,32 @@ async def quantize_model_to_ne301(
             data=str(data_yaml_path),
             fraction=fraction
         )
+        print(f"DEBUG: YOLO export returned path: {export_path}")
         export_path = Path(export_path)
         
         if not export_path.exists():
             raise HTTPException(status_code=500, detail="TFLite export failed: output file not found")
+            
+        print(f"DEBUG: Contents of temp_dir {temp_dir}:")
+        for p in temp_dir.rglob("*"):
+            if p.is_file():
+                print(f"  File: {p}")
+            elif p.is_dir():
+                print(f"  Dir:  {p}")
         
         # Step 2: NE301 quantization (if needed, use the existing quantization script)
         quant_dir = Path(__file__).resolve().parent.parent / "quantization"
         script_path = quant_dir / "tflite_quant.py"
         
-        saved_model_dir = export_path.parent
-        if not saved_model_dir.exists():
-            raise HTTPException(status_code=500, detail="SavedModel directory not found")
+        # Determine the SavedModel path (YOLO creates a directory for it)
+        saved_model_paths = list(temp_dir.glob("*_saved_model"))
+        if not saved_model_paths:
+            # Fallback to the parent of the tflite file
+            saved_model_dir = export_path.parent
+        else:
+            saved_model_dir = saved_model_paths[0]
+            
+        print(f"DEBUG: Using saved_model_dir: {saved_model_dir}")
         
         quant_workdir = saved_model_dir.parent / "ne301_quant"
         quant_workdir.mkdir(parents=True, exist_ok=True)

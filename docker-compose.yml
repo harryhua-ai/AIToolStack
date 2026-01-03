@@ -18,7 +18,7 @@ services:
       - backend-data:/app/backend/data
       # Backend code (for development: code changes take effect after container restart)
       # Note: This allows code changes without rebuilding the image
-      # - ./backend:/app/backend
+      - ./backend:/app/backend
       # Frontend build files (for development: mount local build to avoid rebuilding in Docker)
       # Note: Run 'npm run build' in frontend/ directory first, then mount ./frontend/build:/app/frontend/build
       # If build directory doesn't exist, Dockerfile will use the built-in build from image
