@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Optional, Dict, List
 from datetime import datetime
 
+# IMPORTANT: Clear sys.argv to prevent Ultralytics from parsing uvicorn arguments
+# This must be done BEFORE importing ultralytics
+# The issue: when running under uvicorn, sys.argv contains uvicorn's CLI arguments
+# (e.g., ['backend.main:app', '--host', '0.0.0.0', '--port', '8000'])
+# Ultralytics tries to parse these as YOLO CLI arguments and fails
+if len(sys.argv) > 1 and any('backend.main:app' in str(arg) or arg.startswith('--') for arg in sys.argv):
+    # Save original argv for reference
+    _original_argv = sys.argv.copy()
+    # Clear to empty list (YOLO will use default empty argv)
+    sys.argv = [sys.argv[0]]  # Keep only the program name
+
 # Lazy import ultralytics to avoid requiring installation at module load time
 try:
     from ultralytics import YOLO
@@ -98,11 +109,16 @@ class LogCapture:
             if cleaned_message.strip():
                 # Filter: only capture training-related logs
                 if self._is_training_log(cleaned_message):
-                    # Deduplication: skip if same as last log line (avoid duplicate progress bar updates)
-                    cleaned_stripped = cleaned_message.strip()
-                    if cleaned_stripped != self.last_log_line:
-                        self.last_log_line = cleaned_stripped
+                    # Allow all progress updates through (batch numbers change frequently)
+                    if any(indicator in cleaned_message for indicator in ['%', 'epoch', 'batch', 'G', 'MB']):
+                        # Always allow training progress through without deduplication
                         training_service._add_log(self.training_id, self.project_id, cleaned_message)
+                    else:
+                        # Deduplication: skip if same as last log line (avoid duplicate other messages)
+                        cleaned_stripped = cleaned_message.strip()
+                        if cleaned_stripped != self.last_log_line:
+                            self.last_log_line = cleaned_stripped
+                            training_service._add_log(self.training_id, self.project_id, cleaned_message)
     
     def _is_training_log(self, message: str) -> bool:
         """Determine if message is training-related log"""
@@ -204,6 +220,10 @@ class TrainingService:
         self.training_threads: Dict[str, threading.Thread] = {}
         # Stop signals for graceful interruption: {training_id: Event}
         self.stop_events: Dict[str, threading.Event] = {}
+        # Pause control: {training_id: Condition}
+        self.pause_conditions: Dict[str, threading.Condition] = {}
+        # Pause state flags: {training_id: bool}
+        self.paused_states: Dict[str, bool] = {}
         self.training_lock = threading.RLock()  # Use RLock to allow re-entrant locking
     
     # ========= Database related utility methods =========
@@ -289,7 +309,7 @@ class TrainingService:
         model_size: str = 'n',
         epochs: int = 100,
         imgsz: int = 640,
-        batch: int = 16,
+        batch: int = 16,  # Default: safe for both CPU and GPU
         device: Optional[str] = None,
         lr0: Optional[float] = None,
         lrf: Optional[float] = None,
@@ -297,7 +317,7 @@ class TrainingService:
         momentum: Optional[float] = None,
         weight_decay: Optional[float] = None,
         patience: Optional[int] = None,
-        workers: Optional[int] = None,
+        workers: Optional[int] = None,  # 优化: 将在下面自动设置
         val: Optional[bool] = None,
         save_period: Optional[int] = None,
         amp: Optional[bool] = None,
@@ -313,6 +333,7 @@ class TrainingService:
         fliplr: Optional[float] = None,
         mosaic: Optional[float] = None,
         mixup: Optional[float] = None,
+        cache: Optional[str] = None,
     ) -> Dict:
         """
         Start training task
@@ -379,19 +400,18 @@ class TrainingService:
             # Prepare stop event for this training
             stop_event = threading.Event()
             self.stop_events[training_id] = stop_event
-            
-            # Persist to database
-            print(f"[TrainingService] Persisting training record to database...")
-            self._persist_record(training_info)
-            print(f"[TrainingService] Training record persisted")
-            
+            # Prepare pause condition for this training
+            pause_condition = threading.Condition()
+            self.pause_conditions[training_id] = pause_condition
+            self.paused_states[training_id] = False
+
             # Start training in background thread (pass training_id to generate unique directory name)
             print(f"[TrainingService] Creating training thread...")
             thread = threading.Thread(
                 target=self._run_training,
                 args=(training_id, project_id, dataset_path, training_info, model_type, model_size, epochs, imgsz, batch, device,
                       lr0, lrf, optimizer, momentum, weight_decay, patience, workers, val, save_period, amp,
-                      hsv_h, hsv_s, hsv_v, degrees, translate, scale, shear, perspective, flipud, fliplr, mosaic, mixup,
+                      hsv_h, hsv_s, hsv_v, degrees, translate, scale, shear, perspective, flipud, fliplr, mosaic, mixup, cache,
                       stop_event),
                 daemon=True,
                 name=f"TrainingThread-{training_id}"
@@ -400,14 +420,65 @@ class TrainingService:
             print(f"[TrainingService] Saving thread reference (already holding lock)...")
             self.training_threads[training_id] = thread
             print(f"[TrainingService] Thread reference saved")
-        
+
         # Release lock before starting thread (thread.start() can be slow)
         print(f"[TrainingService] Lock released, starting training thread...")
         thread.start()
+
+        # Persist to database in background (don't block response)
+        print(f"[TrainingService] Scheduling database persist in background...")
+        persist_thread = threading.Thread(
+            target=self._persist_record,
+            args=(training_info,),
+            daemon=True,
+            name=f"PersistThread-{training_id}"
+        )
+        persist_thread.start()
+
         print(f"[TrainingService] Training thread started, returning training_info")
-        
+
         return training_info
-    
+
+    def _cleanup_training_state(self, training_id: str, project_id: str) -> None:
+        """
+        Cleanup training state, ensuring active_trainings, threads, and stop events are cleared.
+        This is critical for preventing 'Training already in progress' errors.
+
+        Args:
+            training_id: Training ID to clean up
+            project_id: Project ID associated with the training
+        """
+        try:
+            with self.training_lock:
+                # Clean up active_trainings if this training was marked as active
+                # We check the training_id to avoid cleaning up a newer training
+                if project_id in self.active_trainings and self.active_trainings[project_id] == training_id:
+                    del self.active_trainings[project_id]
+                    logger.info(f"[Training] Cleanup: Cleared active training for project {project_id}, training_id: {training_id}")
+
+                # Clean up thread tracking
+                if training_id in self.training_threads:
+                    del self.training_threads[training_id]
+                    logger.debug(f"[Training] Cleanup: Removed thread tracking for {training_id}")
+
+                # Clean up stop events
+                if training_id in self.stop_events:
+                    del self.stop_events[training_id]
+                    logger.debug(f"[Training] Cleanup: Removed stop event for {training_id}")
+
+                # Clean up pause conditions
+                if training_id in self.pause_conditions:
+                    del self.pause_conditions[training_id]
+                    logger.debug(f"[Training] Cleanup: Removed pause condition for {training_id}")
+
+                # Clean up paused states
+                if training_id in self.paused_states:
+                    del self.paused_states[training_id]
+                    logger.debug(f"[Training] Cleanup: Removed paused state for {training_id}")
+        except Exception as cleanup_error:
+            # Log but don't raise - cleanup errors shouldn't prevent other cleanup
+            logger.error(f"[Training] Error during cleanup for training {training_id}: {cleanup_error}", exc_info=True)
+
     def _run_training(
         self,
         training_id: str,
@@ -442,16 +513,30 @@ class TrainingService:
         fliplr: Optional[float] = None,
         mosaic: Optional[float] = None,
         mixup: Optional[float] = None,
+        cache: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
+        checkpoint_path: Optional[Path] = None,
+        original_record: Optional[Dict] = None,
     ):
-        """Run training in background thread"""
+        """Run training in background thread
+
+        Args:
+            checkpoint_path: If provided, resume training from this checkpoint
+            original_record: Original training record (used when resuming)
+        """
         print(f"[TrainingThread-{training_id}] Thread started, beginning training process")
+
+        # Small delay to allow main thread to return response before heavy operations
+        import time
+        time.sleep(0.1)
+
         record_for_db = None
         training_success = False
         stop_requested = False
         model = None  # Keep model reference for cleanup
         # Use shared stop event if not provided (backward safety)
         stop_event = stop_event or self.stop_events.get(training_id)
+
         try:
             if YOLO is None:
                 raise ImportError("ultralytics library is not installed. Please install it with: pip install ultralytics")
@@ -501,45 +586,76 @@ class TrainingService:
                 # so ultralytics will automatically download weights from GitHub
                 model_name_str = f'{model_type}{model_size}'
                 model_file_name = f'{model_type}{model_size}.pt'
-                self._add_log(training_id, project_id, f"Loading pretrained model: {model_file_name}")
+
+                # If checkpoint_path is provided, resume from checkpoint
+                if checkpoint_path and checkpoint_path.exists():
+                    self._add_log(training_id, project_id, f"Resuming from checkpoint: {checkpoint_path}")
+                    try:
+                        model = YOLO(str(checkpoint_path))
+                        self._add_log(training_id, project_id, "Checkpoint loaded successfully")
+                        # For resumed training, model_type and model_size come from the checkpoint
+                        # We don't need to re-download
+                    except Exception as e:
+                        error_msg = f"Failed to load checkpoint: {str(e)}"
+                        self._add_log(training_id, project_id, error_msg)
+                        raise FileNotFoundError(error_msg) from e
+                else:
+                    self._add_log(training_id, project_id, f"Loading pretrained model: {model_file_name}")
+
+                    try:
+                        # Use model name string, ultralytics will automatically download weights
+                        model = YOLO(model_name_str)
+                        self._add_log(training_id, project_id, "Model loaded successfully")
+                    except Exception as e:
+                        error_msg = str(e)
+                        # If network-related error, provide friendly message
+                        if any(keyword in error_msg.lower() for keyword in ['download', 'connection', 'ssl', 'url', 'network', 'timeout']):
+                            download_url = f"https://github.com/ultralytics/assets/releases/download/v8.1.0/{model_file_name}"
+                            home_dir = Path.home()
+                            raise ConnectionError(
+                                f"Unable to download pretrained model {model_file_name}.\n\n"
+                                f"Solutions:\n"
+                                f"1. Check network connection\n"
+                                f"2. Manual download: {download_url}\n"
+                                f"3. Place in one of the following locations:\n"
+                                f"   - {Path.cwd() / model_file_name}\n"
+                                f"   - {home_dir / '.ultralytics' / 'weights' / model_file_name}\n"
+                                f"   - {home_dir / '.cache' / 'ultralytics' / model_file_name}\n"
+                                f"4. Then use file path to load model\n"
+                            ) from e
+                        # If file not found error, provide same message (might be auto-download failure)
+                        if 'FileNotFoundError' in str(type(e).__name__) or 'No such file' in error_msg:
+                            download_url = f"https://github.com/ultralytics/assets/releases/download/v8.1.0/{model_file_name}"
+                            home_dir = Path.home()
+                            raise FileNotFoundError(
+                                f"Pretrained model {model_file_name} not found and auto-download failed.\n\n"
+                                f"Solutions:\n"
+                                f"1. Check network connection\n"
+                                f"2. Manual download: {download_url}\n"
+                                f"3. Place in one of the following locations:\n"
+                                f"   - {Path.cwd() / model_file_name}\n"
+                                f"   - {home_dir / '.ultralytics' / 'weights' / model_file_name}\n"
+                                f"   - {home_dir / '.cache' / 'ultralytics' / model_file_name}\n"
+                            ) from e
+                        raise
                 
-                try:
-                    # Use model name string, ultralytics will automatically download weights
-                    model = YOLO(model_name_str)
-                    self._add_log(training_id, project_id, "Model loaded successfully")
-                except Exception as e:
-                    error_msg = str(e)
-                    # If network-related error, provide friendly message
-                    if any(keyword in error_msg.lower() for keyword in ['download', 'connection', 'ssl', 'url', 'network', 'timeout']):
-                        download_url = f"https://github.com/ultralytics/assets/releases/download/v8.1.0/{model_file_name}"
-                        home_dir = Path.home()
-                        raise ConnectionError(
-                            f"Unable to download pretrained model {model_file_name}.\n\n"
-                            f"Solutions:\n"
-                            f"1. Check network connection\n"
-                            f"2. Manual download: {download_url}\n"
-                            f"3. Place in one of the following locations:\n"
-                            f"   - {Path.cwd() / model_file_name}\n"
-                            f"   - {home_dir / '.ultralytics' / 'weights' / model_file_name}\n"
-                            f"   - {home_dir / '.cache' / 'ultralytics' / model_file_name}\n"
-                            f"4. Then use file path to load model\n"
-                        ) from e
-                    # If file not found error, provide same message (might be auto-download failure)
-                    if 'FileNotFoundError' in str(type(e).__name__) or 'No such file' in error_msg:
-                        download_url = f"https://github.com/ultralytics/assets/releases/download/v8.1.0/{model_file_name}"
-                        home_dir = Path.home()
-                        raise FileNotFoundError(
-                            f"Pretrained model {model_file_name} not found and auto-download failed.\n\n"
-                            f"Solutions:\n"
-                            f"1. Check network connection\n"
-                            f"2. Manual download: {download_url}\n"
-                            f"3. Place in one of the following locations:\n"
-                            f"   - {Path.cwd() / model_file_name}\n"
-                            f"   - {home_dir / '.ultralytics' / 'weights' / model_file_name}\n"
-                            f"   - {home_dir / '.cache' / 'ultralytics' / model_file_name}\n"
-                        ) from e
-                    raise
-                
+                # Auto-optimize workers for CPU training if not specified
+                if workers is None:
+                    import os
+                    cpu_count = os.cpu_count() or 8
+
+                    # CPU-optimized: use fewer workers to avoid resource exhaustion
+                    if device and 'cuda' in str(device).lower():
+                        # GPU training: can use more workers since GPU does compute
+                        workers = min(cpu_count, 8)
+                        self._add_log(training_id, project_id,
+                            f"GPU training: configured {workers} workers (cores: {cpu_count})")
+                    else:
+                        # CPU training: use 50-75% of cores for workers (leave room for compute)
+                        workers = max(2, min(cpu_count // 2, 6))
+                        self._add_log(training_id, project_id,
+                            f"CPU training: configured {workers} workers (cores: {cpu_count})")
+
                 # Prepare training parameters (following ultralytics documentation)
                 # Use training_id to generate unique training directory name, avoid overwriting multiple trainings
                 train_args = {
@@ -551,6 +667,7 @@ class TrainingService:
                     'project': str(dataset_path.parent),
                     'name': f'train_{training_id}',  # Use training_id to ensure each training has unique directory
                     'exist_ok': False,  # Changed to False, as each training should use new directory
+                    # Note: 'timeout' is NOT a valid YOLO parameter, removed
                 }
                 
                 # Add optional parameters (if provided)
@@ -566,14 +683,22 @@ class TrainingService:
                     train_args['weight_decay'] = weight_decay
                 if patience is not None:
                     train_args['patience'] = patience
+                    self._add_log(training_id, project_id, f"Early stopping patience: {patience} epochs")
+                else:
+                    self._add_log(training_id, project_id, "Early stopping patience: 100 (default)")
                 if workers is not None:
                     train_args['workers'] = workers
                 if val is not None:
                     train_args['val'] = val
+                    self._add_log(training_id, project_id, f"Validation: {'enabled' if val else 'disabled'}")
                 if save_period is not None:
                     train_args['save_period'] = save_period
                 if amp is not None:
                     train_args['amp'] = amp
+                else:
+                    # Disable AMP for CPU by default (not well supported)
+                    if not device or 'cpu' in str(device).lower():
+                        train_args['amp'] = False
                 
                 # Data augmentation parameters (if provided, otherwise use defaults)
                 augment_info = {
@@ -593,6 +718,25 @@ class TrainingService:
                 
                 # Add data augmentation parameters to training arguments
                 train_args.update(augment_info)
+
+                # Handle cache parameter
+                if cache is not None:
+                    if cache.lower() in ('ram', 'disk'):
+                        train_args['cache'] = cache.lower()
+                        self._add_log(training_id, project_id, f"Dataset caching: {cache.lower()}")
+                    else:
+                        self._add_log(training_id, project_id,
+                            f"Warning: Invalid cache value '{cache}', using default (no cache)")
+                else:
+                    self._add_log(training_id, project_id, "Dataset caching: disabled (default)")
+
+                # CPU-specific optimizations
+                if not device or 'cpu' in str(device).lower():
+                    # Ensure AMP is disabled (not well supported on CPU)
+                    train_args['amp'] = False
+                    # Note: batch defaults to 16, which is safe for CPU
+                    # For GPU training, consider increasing to 32-64 for better performance
+                # Inject stop callbacks for graceful cancellation (use model.add_callback to avoid unsupported args)
                 # Inject stop callbacks for graceful cancellation (use model.add_callback to avoid unsupported args)
                 if stop_event and hasattr(model, "add_callback"):
                     stop_logged = {'flag': False}
@@ -614,10 +758,129 @@ class TrainingService:
                     except Exception:
                         # Best-effort: if callback registration fails, continue without graceful stop
                         pass
-                
+
+                # Inject pause callbacks for pause/continue functionality
+                pause_cond = self.pause_conditions.get(training_id)
+                if pause_cond and hasattr(model, "add_callback"):
+                    pause_logged = {'flag': False}
+
+                    def _handle_pause(trainer):
+                        # Called inside training loop; check if paused and wait
+                        is_paused = self.paused_states.get(training_id, False)
+                        if is_paused:
+                            with pause_cond:
+                                if not pause_logged['flag']:
+                                    pause_logged['flag'] = True
+                                    self._add_log(training_id, project_id, "Training paused...")
+                                    # Update status to paused
+                                    with self.training_lock:
+                                        for record in self.training_records.get(project_id, []):
+                                            if record.get('training_id') == training_id:
+                                                record['status'] = 'paused'
+                                                self._update_db_fields(training_id, project_id, status='paused')
+                                                break
+                                # Wait for continue signal, check every second for stop signal
+                                while self.paused_states.get(training_id, False):
+                                    pause_cond.wait(timeout=1.0)
+                                    if stop_event and stop_event.is_set():
+                                        break
+                                pause_logged['flag'] = False
+                                self._add_log(training_id, project_id, "Training resumed")
+                                # Update status back to running
+                                with self.training_lock:
+                                    for record in self.training_records.get(project_id, []):
+                                        if record.get('training_id') == training_id:
+                                            record['status'] = 'running'
+                                            self._update_db_fields(training_id, project_id, status='running')
+                                            break
+
+                    try:
+                        model.add_callback("on_train_batch_end", _handle_pause)
+                        model.add_callback("on_train_epoch_end", _handle_pause)
+                    except Exception:
+                        # Best-effort: if callback registration fails, continue without pause support
+                        pass
+
+                # Progress monitoring for CPU training - detect and recover from stalls
+                if hasattr(model, "add_callback"):
+                    import time
+                    progress_state = {
+                        'last_batch': 0,
+                        'last_update_time': None,
+                        'stall_count': 0,
+                        'max_stalls': 3,  # Auto-retry up to 3 times
+                        'stall_timeout': 120,  # 2 minutes without progress = stalled
+                    }
+
+                    def _monitor_progress(trainer):
+                        current_batch = getattr(trainer, 'batch', 0)
+                        current_time = time.time()
+
+                        # Initialize on first call
+                        if progress_state['last_update_time'] is None:
+                            progress_state['last_update_time'] = current_time
+                            progress_state['last_batch'] = current_batch
+                            return
+
+                        # Check if we've made progress
+                        if current_batch > progress_state['last_batch']:
+                            # Progress made - reset stall tracking
+                            progress_state['last_batch'] = current_batch
+                            progress_state['last_update_time'] = current_time
+                            progress_state['stall_count'] = 0
+                        else:
+                            # No progress - check if stalled
+                            elapsed = current_time - progress_state['last_update_time']
+                            if elapsed > progress_state['stall_timeout']:
+                                progress_state['stall_count'] += 1
+                                self._add_log(training_id, project_id,
+                                    f"WARNING: Training stalled for {elapsed:.0f}s at batch {current_batch} "
+                                    f"(stall #{progress_state['stall_count']}/{progress_state['max_stalls']})")
+
+                                if progress_state['stall_count'] >= progress_state['max_stalls']:
+                                    self._add_log(training_id, project_id,
+                                        "CRITICAL: Training stalled multiple times, attempting graceful stop...")
+                                    # Trigger stop to allow retry logic
+                                    setattr(trainer, "stop", True)
+                                    setattr(trainer, "stop_training", True)
+
+                                progress_state['last_update_time'] = current_time
+
+                    try:
+                        model.add_callback("on_train_batch_end", _monitor_progress)
+                    except Exception:
+                        # Best-effort: if callback registration fails, continue without monitoring
+                        pass
+
+                # Log training mode clearly
+                if not device or 'cpu' in str(device).lower():
+                    import os
+                    self._add_log(training_id, project_id,
+                        f"Training mode: CPU ONLY ({os.cpu_count() or 8} cores detected)")
+                    self._add_log(training_id, project_id,
+                        "Note: CPU training is slower than GPU. Consider using GPU for faster training.")
+                else:
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            gpu_name = torch.cuda.get_device_name(0)
+                            self._add_log(training_id, project_id, f"Training mode: GPU ({gpu_name})")
+                    except Exception:
+                        self._add_log(training_id, project_id, "Training mode: GPU")
+
                 self._add_log(training_id, project_id, "=" * 60)
                 self._add_log(training_id, project_id, "Starting training")
                 self._add_log(training_id, project_id, "=" * 60)
+
+                # Diagnostic logging before training
+                self._add_log(training_id, project_id, "=== Training Configuration ===")
+                self._add_log(training_id, project_id, f"Epochs: {epochs}")
+                patience_value = patience if patience else 100
+                self._add_log(training_id, project_id, f"Patience: {patience_value}")
+                self._add_log(training_id, project_id, f"Device: {device if device else 'auto'}")
+                self._add_log(training_id, project_id, f"Batch: {batch}")
+                self._add_log(training_id, project_id, "===================================")
+
                 self._add_log(training_id, project_id, f"Training parameters:")
                 self._add_log(training_id, project_id, f"  data: {train_args['data']}")
                 self._add_log(training_id, project_id, f"  epochs: {epochs}")
@@ -632,7 +895,49 @@ class TrainingService:
                 # Run training (ultralytics will handle all details automatically)
                 # verbose=True ensures detailed training information output
                 train_args['verbose'] = True
-                results = model.train(**train_args)
+
+                # Auto-retry wrapper for CPU training (handles stalls)
+                is_cpu_training = not device or 'cpu' in str(device).lower()
+                max_retries = 2 if is_cpu_training else 0  # Only retry for CPU
+
+                for attempt in range(max_retries + 1):
+                    try:
+                        if attempt > 0:
+                            # Reset progress state for retry
+                            if 'progress_state' in locals():
+                                progress_state['stall_count'] = 0
+                                progress_state['last_update_time'] = None
+                            self._add_log(training_id, project_id,
+                                f"Retrying training (attempt {attempt + 1}/{max_retries + 1})...")
+                            import time
+                            time.sleep(5)  # Brief pause before retry
+
+                        results = model.train(**train_args)
+
+                        # Post-training diagnostics
+                        self._add_log(training_id, project_id, "=== Training Completed ===")
+                        try:
+                            if hasattr(results, 'results_dict'):
+                                metrics = results.results_dict
+                                self._add_log(training_id, project_id, f"Final Fitness: {metrics.get('metrics/fitness(B)', 'N/A')}")
+                                self._add_log(training_id, project_id, f"Final mAP50: {metrics.get('metrics/mAP50(B)', 'N/A')}")
+                            if hasattr(results, 'epochs'):
+                                self._add_log(training_id, project_id, f"Epochs Run: {results.epochs}")
+                        except Exception as e:
+                            self._add_log(training_id, project_id, f"Warning: Could not extract diagnostics: {e}")
+                        self._add_log(training_id, project_id, "=============================")
+
+                        # If successful, break out of retry loop
+                        break
+
+                    except Exception as e:
+                        if attempt < max_retries:
+                            self._add_log(training_id, project_id,
+                                f"Training attempt {attempt + 1} failed: {str(e)}")
+                        else:
+                            # Re-raise on final attempt
+                            raise
+
                 # Mark if stop was requested after training exits
                 stop_requested = stop_event.is_set() if stop_event else False
                 
@@ -676,16 +981,10 @@ class TrainingService:
                                     record['model_path'] = str(model_path)
                                 record_for_db = record
                             break
-                    
-                    # Clear active training flag
-                    if project_id in self.active_trainings and self.active_trainings[project_id] == training_id:
-                        del self.active_trainings[project_id]
-                # Cleanup stop event reference once training exits
-                if training_id in self.stop_events:
-                    del self.stop_events[training_id]
-                if training_id in self.training_threads:
-                    del self.training_threads[training_id]
-            
+
+                    # Clear active training flag and cleanup
+                    self._cleanup_training_state(training_id, project_id)
+
             # Sync to database
             if record_for_db:
                 try:
@@ -856,15 +1155,8 @@ class TrainingService:
                 
                 # Always clear active training marker and thread tracking (even if training succeeded)
                 # This ensures clean state for next training
-                if project_id in self.active_trainings and self.active_trainings[project_id] == training_id:
-                    del self.active_trainings[project_id]
-                
-                # Clear thread tracking
-                if training_id in self.training_threads:
-                    del self.training_threads[training_id]
-                if training_id in self.stop_events:
-                    del self.stop_events[training_id]
-    
+                self._cleanup_training_state(training_id, project_id)
+
     def _add_log(self, training_id: str, project_id: str, message: str):
         """Add log to training record and write to database"""
         # If message already has timestamp, keep as is; otherwise add timestamp
@@ -873,8 +1165,8 @@ class TrainingService:
             log_entry = f"[{timestamp}] {message}"
         else:
             log_entry = message
-        
-        # Append to memory (compatible with runtime real-time refresh)
+
+        # Append to memory first (lightweight operation)
         with self.training_lock:
             if project_id in self.training_records:
                 for record in self.training_records[project_id]:
@@ -883,29 +1175,49 @@ class TrainingService:
                         if len(record['logs']) > 10000:
                             record['logs'] = record['logs'][-5000:]
                         break
-        
-        # Write to database log table and update log_count
-        session = SessionLocal()
-        try:
-            session.add(TrainingLog(
-                training_id=training_id,
-                project_id=project_id,
-                timestamp=datetime.utcnow(),
-                message=message
-            ))
-            # Update count
-            db_obj = session.query(TrainingRecord).filter(
-                TrainingRecord.training_id == training_id,
-                TrainingRecord.project_id == project_id
-            ).first()
-            if db_obj:
-                db_obj.log_count = (db_obj.log_count or 0) + 1
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            logger.warning(f"[Training] Failed to persist log: {e}")
-        finally:
-            session.close()
+
+        # Write to TrainingLog table asynchronously to avoid blocking
+        def _persist_single_log():
+            session = SessionLocal()
+            try:
+                # Check if log already exists (avoid duplicates)
+                existing = session.query(TrainingLog).filter(
+                    TrainingLog.training_id == training_id,
+                    TrainingLog.message == message,
+                    TrainingLog.timestamp >= datetime.utcnow().replace(second=0, microsecond=0)
+                ).first()
+                if not existing:
+                    session.add(TrainingLog(
+                        training_id=training_id,
+                        project_id=project_id,
+                        timestamp=datetime.utcnow(),
+                        message=message
+                    ))
+
+                    # Update log count
+                    db_obj = session.query(TrainingRecord).filter(
+                        TrainingRecord.training_id == training_id,
+                        TrainingRecord.project_id == project_id
+                    ).first()
+                    if db_obj:
+                        with self.training_lock:
+                            if project_id in self.training_records:
+                                for r in self.training_records[project_id]:
+                                    if r.get('training_id') == training_id:
+                                        db_obj.log_count = len(r.get('logs', []))
+                                        break
+
+                    session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"[Training] Failed to persist log: {e}")
+            finally:
+                session.close()
+
+        # Run in background thread (don't block)
+        import threading
+        thread = threading.Thread(target=_persist_single_log, daemon=True)
+        thread.start()
     
     def _db_record_to_dict(self, db_obj: TrainingRecord) -> Dict:
         """Convert database object to dictionary"""
@@ -1013,13 +1325,8 @@ class TrainingService:
                                 logger.warning(f"[Training] Detected terminated thread for training {training_id}, marked as failed (likely OOM)")
                             except Exception as e:
                                 logger.error(f"[Training] Failed to update terminated training status: {e}")
-                            # Clear active flag and thread tracking
-                            if project_id in self.active_trainings and self.active_trainings[project_id] == training_id:
-                                del self.active_trainings[project_id]
-                            if training_id in self.training_threads:
-                                del self.training_threads[training_id]
-                            if training_id in self.stop_events:
-                                del self.stop_events[training_id]
+                            # Clear active flag and thread tracking using dedicated cleanup method
+                            self._cleanup_training_state(training_id, project_id)
                             break
                 
                 # Return record from memory to ensure logs and status are real-time
@@ -1125,7 +1432,276 @@ class TrainingService:
         except Exception as e:
             logger.error(f"[Training] Failed to start force-stop watcher: {e}")
         return True
-    
+
+    def pause_training(self, project_id: str, training_id: Optional[str] = None) -> bool:
+        """
+        Pause a running training
+
+        Args:
+            project_id: Project ID
+            training_id: Training ID to pause (optional, uses active training if not specified)
+
+        Returns:
+            True if pause was successful, False otherwise
+        """
+        with self.training_lock:
+            # Use provided training_id or get active training
+            target_id = training_id or self.active_trainings.get(project_id)
+            if not target_id:
+                logger.warning(f"[Training] Pause failed: no training found for project {project_id}")
+                return False
+
+            # Find the training record
+            for record in self.training_records.get(project_id, []):
+                if record['training_id'] == target_id:
+                    # Only allow pausing running trainings
+                    if record['status'] != 'running':
+                        logger.warning(f"[Training] Pause failed: training {target_id} is not running (status: {record['status']})")
+                        return False
+
+                    # Set pause flag
+                    self.paused_states[target_id] = True
+                    record['status'] = 'paused'
+                    self._update_db_fields(target_id, project_id, status='paused')
+                    self._add_log(target_id, project_id, "Training paused")
+                    logger.info(f"[Training] Training {target_id} paused")
+                    return True
+
+            logger.warning(f"[Training] Pause failed: training {target_id} not found in records")
+            return False
+
+    def continue_training(self, project_id: str, training_id: Optional[str] = None) -> bool:
+        """
+        Continue a paused training
+
+        Args:
+            project_id: Project ID
+            training_id: Training ID to continue (optional, uses first paused training if not specified)
+
+        Returns:
+            True if continue was successful, False otherwise
+        """
+        with self.training_lock:
+            # Use provided training_id or find first paused training
+            target_id = training_id
+            if not target_id:
+                # Find a paused training for this project
+                for record in self.training_records.get(project_id, []):
+                    if record['status'] == 'paused':
+                        target_id = record['training_id']
+                        break
+
+            if not target_id:
+                logger.warning(f"[Training] Continue failed: no paused training found for project {project_id}")
+                return False
+
+            # Find the training record
+            for record in self.training_records.get(project_id, []):
+                if record['training_id'] == target_id:
+                    # Only allow continuing paused trainings
+                    if record['status'] != 'paused':
+                        logger.warning(f"[Training] Continue failed: training {target_id} is not paused (status: {record['status']})")
+                        return False
+
+                    # Clear pause flag and wake up the training thread
+                    pause_cond = self.pause_conditions.get(target_id)
+                    if pause_cond:
+                        with pause_cond:
+                            self.paused_states[target_id] = False
+                            pause_cond.notify_all()
+
+                    record['status'] = 'running'
+                    self._update_db_fields(target_id, project_id, status='running')
+                    self._add_log(target_id, project_id, "Training continued")
+
+                    # Mark as active training
+                    self.active_trainings[project_id] = target_id
+                    logger.info(f"[Training] Training {target_id} continued")
+                    return True
+
+            logger.warning(f"[Training] Continue failed: training {target_id} not found in records")
+            return False
+
+    def resume_training(
+        self,
+        project_id: str,
+        training_id: str,
+        additional_epochs: Optional[int] = None,
+        device: Optional[str] = None,
+    ) -> Dict:
+        """
+        Resume training from a previous training checkpoint
+
+        Args:
+            project_id: Project ID
+            training_id: Training ID to resume from
+            additional_epochs: Additional epochs to train (optional, uses original if not specified)
+            device: Device to use for training (optional, uses original if not specified)
+
+        Returns:
+            Training information dictionary
+        """
+        print(f"[TrainingService] resume_training called for project {project_id}, training_id {training_id}")
+
+        # Get the original training record
+        original_record = self.get_training_record(project_id, training_id)
+        if not original_record:
+            error_msg = f"Training record {training_id} not found for project {project_id}"
+            print(f"[TrainingService] ERROR: {error_msg}")
+            raise ValueError(error_msg)
+
+        # Check if original training is still running
+        if original_record.get('status') == 'running':
+            error_msg = f"Training {training_id} is still running, cannot resume"
+            print(f"[TrainingService] ERROR: {error_msg}")
+            raise ValueError(error_msg)
+
+        # Find the last.pt checkpoint file
+        model_path = original_record.get('model_path')
+        checkpoint_path = None
+
+        if model_path:
+            # Try to find checkpoint relative to model_path
+            checkpoint_path = Path(model_path).parent.parent / "weights" / "last.pt"
+            if not checkpoint_path.exists():
+                # Try alternative path
+                checkpoint_path = Path(model_path).parent / "last.pt"
+
+        # If still not found, try to construct path from training_id
+        if not checkpoint_path or not checkpoint_path.exists():
+            # YOLO saves checkpoints in train_<training_id>/weights/last.pt
+            # The training directory is in the datasets folder
+            from backend.config import settings
+            datasets_root = getattr(settings, 'DATASETS_ROOT', '/app/datasets')
+            possible_paths = [
+                Path(datasets_root) / project_id / f"train_{training_id}" / "weights" / "last.pt",
+                Path(datasets_root) / project_id / f"train_{training_id}" / "weights" / "last.pt",
+            ]
+
+            for path in possible_paths:
+                if path.exists():
+                    checkpoint_path = path
+                    print(f"[TrainingService] Found checkpoint at: {checkpoint_path}")
+                    break
+
+        if not checkpoint_path or not checkpoint_path.exists():
+            error_msg = f"Checkpoint file not found. Training may not have saved any checkpoints yet."
+            print(f"[TrainingService] ERROR: {error_msg}")
+            raise FileNotFoundError(error_msg)
+
+        print(f"[TrainingService] Using checkpoint at: {checkpoint_path}")
+
+        # Generate new training ID for the resumed training
+        new_training_id = f"{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        print(f"[TrainingService] Generated new training_id: {new_training_id}")
+
+        with self.training_lock:
+            if project_id in self.active_trainings:
+                error_msg = f"Training already in progress for project {project_id}"
+                print(f"[TrainingService] ERROR: {error_msg}")
+                raise ValueError(error_msg)
+
+            # Create stop event for this training
+            stop_event = threading.Event()
+            self.stop_events[new_training_id] = stop_event
+
+            # Mark as active training
+            self.active_trainings[project_id] = new_training_id
+
+            # Get original training parameters
+            original_epochs = original_record.get('epochs', 100)
+            epochs_to_use = additional_epochs if additional_epochs is not None else original_epochs
+            device_to_use = device if device is not None else original_record.get('device')
+
+            # Create training information
+            training_info = {
+                'training_id': new_training_id,
+                'project_id': project_id,
+                'status': 'running',
+                'start_time': datetime.now().isoformat(),
+                'model_type': original_record.get('model_type', 'yolov8'),
+                'model_size': original_record.get('model_size', 'n'),
+                'epochs': epochs_to_use,
+                'imgsz': original_record.get('imgsz', 640),
+                'batch': original_record.get('batch', 16),
+                'device': device_to_use,
+                'resumed_from': training_id,  # Track which training was resumed
+            }
+
+            # Add to training records
+            if project_id not in self.training_records:
+                self.training_records[project_id] = []
+            self.training_records[project_id].append(training_info)
+
+            # Persist to database
+            try:
+                self._persist_record(training_info)
+                self._add_log(new_training_id, project_id,
+                    f"Resuming training from {training_id}")
+                self._add_log(new_training_id, project_id,
+                    f"Checkpoint: {checkpoint_path}")
+                self._add_log(new_training_id, project_id,
+                    f"Additional epochs: {epochs_to_use}")
+            except Exception as e:
+                logger.error(f"[Training] Failed to persist resume training record: {e}")
+
+            # Get dataset path from original training
+            dataset_path = Path(model_path).parent.parent.parent / "yolo_export"
+            if not dataset_path.exists():
+                dataset_path = settings.DATASETS_ROOT / project_id / "yolo_export"
+
+            print(f"[TrainingService] Using dataset path: {dataset_path}")
+
+        # Start training in background thread
+        def _run_resumed_training():
+            try:
+                self._run_training(
+                    training_id=new_training_id,
+                    project_id=project_id,
+                    dataset_path=dataset_path,
+                    training_info=training_info,
+                    model_type=original_record.get('model_type', 'yolov8'),
+                    model_size=original_record.get('model_size', 'n'),
+                    epochs=epochs_to_use,
+                    imgsz=original_record.get('imgsz', 640),
+                    batch=original_record.get('batch', 16),
+                    device=device_to_use,
+                    stop_event=stop_event,
+                    checkpoint_path=checkpoint_path,
+                    original_record=original_record,
+                )
+            except Exception as e:
+                logger.error(f"[Training] Resumed training failed: {e}", exc_info=True)
+                with self.training_lock:
+                    if project_id in self.training_records:
+                        for record in self.training_records[project_id]:
+                            if record.get('training_id') == new_training_id:
+                                record['status'] = 'failed'
+                                record['error'] = str(e)
+                                record['end_time'] = datetime.now().isoformat()
+                                try:
+                                    self._persist_record(record)
+                                    self._add_log(new_training_id, project_id, f"Training failed: {str(e)}")
+                                except Exception:
+                                    pass
+                                break
+                    if project_id in self.active_trainings and self.active_trainings[project_id] == new_training_id:
+                        del self.active_trainings[project_id]
+                    if new_training_id in self.stop_events:
+                        del self.stop_events[new_training_id]
+
+        thread = threading.Thread(target=_run_resumed_training, daemon=True)
+        self.training_threads[new_training_id] = thread
+        thread.start()
+
+        print(f"[TrainingService] Resumed training started with new ID: {new_training_id}")
+
+        return {
+            'training_id': new_training_id,
+            'resumed_from': training_id,
+            'status': 'running',
+        }
+
     def clear_training(self, project_id: str, training_id: Optional[str] = None):
         """Clear training record and delete model files"""
         # To avoid deletion failure due to memory loss, prioritize reading records to delete from database

@@ -55,8 +55,13 @@
 ---
 
 ## 环境要求
-- **Docker & docker-compose（必需）**  
-  请参考 [Docker 官方安装指南](https://docs.docker.com/get-docker/) 和 [docker-compose 指南](https://docs.docker.com/compose/install/) 进行部署。
+- **Docker & Docker Compose（必需）**
+  请参考 [Docker 官方安装指南](https://docs.docker.com/get-docker/) 和 [Docker Compose 指南](https://docs.docker.com/compose/install/) 进行部署。
+
+  > **提示**：本项目使用 Docker Compose V2 语法（`docker compose`，空格分隔）。如果您习惯使用旧版 `docker-compose` 命令，可以添加别名：
+  > ```bash
+  > echo 'alias docker-compose="docker compose"' >> ~/.bashrc && source ~/.bashrc
+  > ```
 - **NE301 量化模型包生成**  
   需预拉取量化环境镜像：
   ```
@@ -78,8 +83,8 @@
 
 2. Docker 部署项目
    ```bash
-   docker-compose build
-   docker-compose up
+   docker compose build
+   docker compose up
    ```
 
    > **提示：主要参数已在配置文件定义。若需自定义 `MQTT_BROKER_HOST` 等，请编辑 `docker-compose.yml` 的环境变量项，并确保设备可访问「宿主机实际IP」。**
@@ -110,7 +115,7 @@ cd backend   && pip install -r requirements.txt && uvicorn main:app --reload
 
 ## 端口与环境变量说明
 
-- **默认端口（docker-compose）**：
+- **默认端口（Docker Compose）**：
   - API（后端）：`8000`
   - 前端 React：`3000`（容器内、通过代理直连后端）
 - **主要环境变量（可自定义）**：
@@ -118,7 +123,7 @@ cd backend   && pip install -r requirements.txt && uvicorn main:app --reload
   - `MQTT_BROKER_HOST`：MQTT Broker 服务主机名或 IP（如设备间网络需指定宿主机真实 IP）
   - `MQTT_BROKER`, `MQTT_TOPIC`：NE301 端 MQTT 配置
   - `DATASETS_ROOT`：后端数据集目录（建议挂载映射持久化）
-  - 其他详细变量可通过 `.env` 文件或 docker-compose 环境中覆盖
+  - 其他详细变量可通过 `.env` 文件或 Docker Compose 环境中覆盖
 
 ---
 

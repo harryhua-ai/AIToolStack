@@ -21,7 +21,7 @@ interface TrainingPanelProps {
 
 interface TrainingRecord {
   training_id: string;
-  status: 'not_started' | 'running' | 'completed' | 'failed' | 'stopped';
+  status: 'not_started' | 'running' | 'paused' | 'completed' | 'failed' | 'stopped';
   start_time?: string;
   end_time?: string;
   model_type?: string;
@@ -148,6 +148,15 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
   const [imgszInput, setImgszInput] = useState('');
   const [batchInput, setBatchInput] = useState('');
 
+  // ETA 相关状态
+  const [eta, setEta] = useState<Date | null>(null);
+  const [etaStatus, setEtaStatus] = useState<'calculating' | 'available' | 'unavailable'>('calculating');
+
+  // Epoch 时间跟踪状态（用于更准确的 ETA 计算）
+  const [epochTimes, setEpochTimes] = useState<number[]>([]);  // 每个epoch的完成时间（毫秒）
+  const [lastEpochUpdate, setLastEpochUpdate] = useState<number>(0);  // 上次更新的epoch编号
+  const [lastEpochUpdateTime, setLastEpochUpdateTime] = useState<number>(0);  // 上次更新的时间戳
+
   // Sync numeric text inputs when配置弹窗打开
   useEffect(() => {
     if (showConfigModal) {
@@ -167,8 +176,62 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
   const logsEndRef = useRef<HTMLDivElement>(null);
   const recordsIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const logsIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const currentStatus = trainingRecords.find(r => r.training_id === selectedTrainingId) || 
+  const currentStatus = trainingRecords.find(r => r.training_id === selectedTrainingId) ||
                        (trainingRecords.length > 0 ? trainingRecords[0] : null);
+
+  // 添加从日志解析当前 epoch 的函数
+  const parseCurrentEpoch = useCallback((logs: string[]): number | null => {
+    for (let i = logs.length - 1; i >= 0; i--) {
+      // 匹配 "数字/数字" 格式，如 "1/100"
+      const match = logs[i].match(/\s(\d+)\/(\d+)\s/);
+      if (match) {
+        const current = parseInt(match[1], 10);
+        const total = parseInt(match[2], 10);
+        if (current > 0 && current <= total) {
+          return current;
+        }
+      }
+    }
+    return null;
+  }, []);
+
+  // 添加 ETA 计算函数
+  const calculateETA = useCallback((
+    startTime: string,
+    currentEpoch: number,
+    totalEpochs: number
+  ): Date | null => {
+    if (!startTime || !currentEpoch || !totalEpochs || currentEpoch <= 0) {
+      return null;
+    }
+
+    const start = new Date(startTime).getTime();
+    const now = Date.now();
+    const elapsed = now - start;
+    const timePerEpoch = elapsed / currentEpoch;
+    const remainingEpochs = totalEpochs - currentEpoch;
+
+    return new Date(now + timePerEpoch * remainingEpochs);
+  }, []);
+
+  // 添加相对时间格式化函数
+  const formatRelativeTime = (date: Date): string => {
+    const now = Date.now();
+    const diff = date.getTime() - now;
+
+    if (diff < 0) return '';
+
+    const minutes = Math.floor(diff / 60000);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) {
+      const mins = minutes % 60;
+      return `(~${hours}h ${mins}m remaining)`;
+    } else if (minutes > 0) {
+      return `(~${minutes}m remaining)`;
+    }
+    return '(< 1m remaining)';
+  };
 
   // Function to fetch training record list
   const fetchRecords = useCallback(async () => {
@@ -341,6 +404,40 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
     }
   }, [trainingLogs]);
 
+  // 计算 ETA (Estimated Time of Completion)
+  useEffect(() => {
+    if (!selectedTrainingId || !currentStatus) return;
+
+    // 只在训练运行时计算 ETA
+    if (currentStatus.status !== 'running') {
+      setEta(null);
+      setEtaStatus('unavailable');
+      return;
+    }
+
+    // 解析当前 epoch
+    const currentEpoch = parseCurrentEpoch(trainingLogs);
+
+    if (currentEpoch && currentStatus.start_time && currentStatus.epochs) {
+      // 计算 ETA
+      const estimated = calculateETA(
+        currentStatus.start_time,
+        currentEpoch,
+        currentStatus.epochs
+      );
+      if (estimated) {
+        setEta(estimated);
+        setEtaStatus('available');
+      } else {
+        setEta(null);
+        setEtaStatus('calculating');
+      }
+    } else {
+      setEta(null);
+      setEtaStatus('calculating');
+    }
+  }, [trainingLogs, selectedTrainingId, currentStatus, parseCurrentEpoch, calculateETA]);
+
   const handleStartTraining = async () => {
     setIsLoading(true);
     try {
@@ -442,8 +539,17 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
           });
 
           if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || t('training.stopTrainingFailed'));
+            // Try to parse as JSON first, fall back to text if JSON parsing fails
+            let errorMessage = t('training.stopTrainingFailed');
+            try {
+              const error = await response.json();
+              errorMessage = error.detail || errorMessage;
+            } catch {
+              // JSON parse failed, try text
+              const textError = await response.text();
+              errorMessage = textError || errorMessage;
+            }
+            throw new Error(errorMessage);
           }
           // After stopping, refresh records and logs
           await fetchRecords();
@@ -455,6 +561,164 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
       },
       {
         variant: 'warning',
+      }
+    );
+  };
+
+  const handlePauseTraining = async () => {
+    showConfirm(
+      t('training.confirmPause'),
+      async () => {
+        setIsLoading(true);
+        try {
+          const response = await fetch(`${API_BASE_URL}/projects/${projectId}/train/pause${selectedTrainingId ? `?training_id=${selectedTrainingId}` : ''}`, {
+            method: 'POST',
+          });
+          if (!response.ok) {
+            let errorMessage = t('training.pauseTrainingFailed');
+            try {
+              const error = await response.json();
+              errorMessage = error.detail || errorMessage;
+            } catch {
+              const textError = await response.text();
+              errorMessage = textError || errorMessage;
+            }
+            throw new Error(errorMessage);
+          }
+          await fetchRecords();
+        } catch (error: any) {
+          showError(`${t('training.pauseTrainingFailed')}: ${error.message}`);
+        } finally {
+          setIsLoading(false);
+        }
+      },
+      { variant: 'info' }
+    );
+  };
+
+  const handleContinueTraining = async () => {
+    showConfirm(
+      t('training.confirmContinue'),
+      async () => {
+        setIsLoading(true);
+        try {
+          const response = await fetch(`${API_BASE_URL}/projects/${projectId}/train/continue${selectedTrainingId ? `?training_id=${selectedTrainingId}` : ''}`, {
+            method: 'POST',
+          });
+          if (!response.ok) {
+            let errorMessage = t('training.continueTrainingFailed');
+            try {
+              const error = await response.json();
+              errorMessage = error.detail || errorMessage;
+            } catch {
+              const textError = await response.text();
+              errorMessage = textError || errorMessage;
+            }
+            throw new Error(errorMessage);
+          }
+          await fetchRecords();
+        } catch (error: any) {
+          showError(`${t('training.continueTrainingFailed')}: ${error.message}`);
+        } finally {
+          setIsLoading(false);
+        }
+      },
+      { variant: 'info' }
+    );
+  };
+
+  const handleResumeTraining = async () => {
+    if (!selectedTrainingId) return;
+
+    showConfirm(
+      t('training.confirmResume'),
+      async () => {
+        setIsLoading(true);
+        try {
+          const response = await fetch(`${API_BASE_URL}/projects/${projectId}/train/${selectedTrainingId}/resume`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({}),  // Empty body for default resume
+          });
+
+          if (!response.ok) {
+            // Try to parse as JSON first, fall back to text if JSON parsing fails
+            if (response.status === 404) {
+              showError(t('training.checkpointNotFound'));
+            } else {
+              let errorMessage = t('training.resumeTrainingFailed');
+              try {
+                const error = await response.json();
+                errorMessage = error.detail || errorMessage;
+              } catch {
+                // JSON parse failed, try text
+                const textError = await response.text();
+                errorMessage = textError || errorMessage;
+              }
+              throw new Error(errorMessage);
+            }
+            return;
+          }
+
+          const data = await response.json();
+
+          // Close modal and refresh records
+          setShowConfigModal(false);
+
+          // Reset configuration to initial state
+          setEpochsInput('');
+          setImgszInput('');
+          setBatchInput('');
+          setTrainingConfig({
+            model_type: 'yolov8',
+            model_size: 'n',
+            epochs: 100,
+            imgsz: 640,
+            batch: 16,
+            device: undefined,
+            lr0: undefined,
+            lrf: undefined,
+            optimizer: undefined,
+            momentum: undefined,
+            weight_decay: undefined,
+            patience: undefined,
+            workers: undefined,
+            val: undefined,
+            save_period: undefined,
+            amp: undefined,
+            hsv_h: undefined,
+            hsv_s: undefined,
+            hsv_v: undefined,
+            degrees: undefined,
+            translate: undefined,
+            scale: undefined,
+            shear: undefined,
+            perspective: undefined,
+            flipud: undefined,
+            fliplr: undefined,
+            mosaic: undefined,
+            mixup: undefined,
+          });
+
+          // Immediately refresh training record list
+          await fetchRecords();
+
+          // If new training ID is returned, select it
+          if (data.training_id) {
+            setSelectedTrainingId(data.training_id);
+          }
+        } catch (error: any) {
+          if (error.message !== t('training.checkpointNotFound')) {
+            showError(`${t('training.resumeTrainingFailed')}: ${error.message}`);
+          }
+        } finally {
+          setIsLoading(false);
+        }
+      },
+      {
+        variant: 'info',
       }
     );
   };
@@ -653,8 +917,10 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
   };
 
   const isTraining = currentStatus?.status === 'running';
+  const isPaused = currentStatus?.status === 'paused';
   const isCompleted = currentStatus?.status === 'completed';
   const isFailed = currentStatus?.status === 'failed';
+  const isStopped = currentStatus?.status === 'stopped';
 
   return (
     <div className="training-panel-overlay">
@@ -704,6 +970,7 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
                           {record.start_time ? new Date(record.start_time).toLocaleString(i18n.language === 'zh' ? 'zh-CN' : 'en-US') : t('common.unknown', '未知时间')}
                         </span>
                         <span className={`record-status status-${record.status}`}>
+                          {record.status === 'paused' && t('training.statusPaused')}
                           {record.status === 'running' && t('training.statusRunning')}
                           {record.status === 'completed' && t('training.statusCompleted')}
                           {record.status === 'failed' && t('training.statusFailed')}
@@ -831,6 +1098,35 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
                       </div>
                     )}
 
+                    {/* 预计完成时间 - 新增 */}
+                    {currentStatus.status === 'running' && (
+                      <div className="status-item">
+                        <span className="status-label">{t('training.estimatedTime')}:</span>
+                        <span className="status-value">
+                          {etaStatus === 'calculating' && (
+                            <span className="eta-calculating">{t('training.calculating')}</span>
+                          )}
+                          {etaStatus === 'available' && eta && (
+                            <>
+                              <span className="eta-absolute">
+                                {eta.toLocaleString(i18n.language === 'zh' ? 'zh-CN' : 'en-US', {
+                                  year: 'numeric',
+                                  month: 'numeric',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit'
+                                })}
+                              </span>
+                              <span className="eta-relative"> {formatRelativeTime(eta)}</span>
+                            </>
+                          )}
+                          {etaStatus === 'unavailable' && (
+                            <span className="eta-unavailable">{t('training.unableToEstimate')}</span>
+                          )}
+                        </span>
+                      </div>
+                    )}
+
                     {currentStatus.imgsz !== undefined && (
                       <div className="status-item">
                         <span className="status-label">{t('training.imageSize')}:</span>
@@ -898,15 +1194,65 @@ export const TrainingPanel: React.FC<TrainingPanelProps> = ({ projectId, onClose
                   </div>
 
                   <div className="training-actions">
+                    {/* running 状态：显示暂停和停止按钮 */}
                     {isTraining && (
+                      <>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="btn-pause-training"
+                          onClick={handlePauseTraining}
+                        >
+                          {t('training.pauseTraining')}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="btn-stop-training"
+                          onClick={handleStopTraining}
+                        >
+                          {t('training.stopTraining')}
+                        </Button>
+                      </>
+                    )}
+
+                    {/* paused 状态：显示继续和停止按钮 */}
+                    {isPaused && (
+                      <>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="btn-continue-training"
+                          onClick={handleContinueTraining}
+                        >
+                          {t('training.continueTraining')}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="btn-stop-training"
+                          onClick={handleStopTraining}
+                        >
+                          {t('training.stopTraining')}
+                        </Button>
+                      </>
+                    )}
+
+                    {/* stopped/failed 状态：显示从检查点重新开始 */}
+                    {!isTraining && !isPaused && (isStopped || isFailed) && selectedTrainingId && (
                       <Button
                         type="button"
-                        variant="outline"
+                        variant="primary"
                         size="sm"
-                        className="btn-stop-training"
-                        onClick={handleStopTraining}
+                        className="btn-resume-training"
+                        onClick={handleResumeTraining}
+                        disabled={isLoading}
                       >
-                        {t('training.stopTraining')}
+                        {t('training.resumeFromCheckpoint')}
                       </Button>
                     )}
                   </div>

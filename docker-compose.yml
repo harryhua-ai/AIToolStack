@@ -22,7 +22,7 @@ services:
       # Frontend build files (for development: mount local build to avoid rebuilding in Docker)
       # Note: Run 'npm run build' in frontend/ directory first, then mount ./frontend/build:/app/frontend/build
       # If build directory doesn't exist, Dockerfile will use the built-in build from image
-      # - ./frontend/build:/app/frontend/build
+      - ./frontend/build:/app/frontend/build
       # NE301 project directory (auto-initialized)
       # Container will automatically detect on startup: if host directory is empty, auto-clone; otherwise use existing content
       # Docker-in-Docker compilation requires host path, so mounting is required (auto-initialized)

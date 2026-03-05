@@ -258,7 +258,7 @@ class TrainingRequest(BaseModel):
     model_size: str = 'n'  # 'n', 's', 'm', 'l', 'x'
     epochs: int = 100
     imgsz: int = 640
-    batch: int = 16
+    batch: int = 64  # 优化: 默认 64 (平衡速度和稳定性)
     device: Optional[str] = None
     # Learning rate related
     lr0: Optional[float] = None  # Initial learning rate
@@ -286,6 +286,8 @@ class TrainingRequest(BaseModel):
     fliplr: Optional[float] = None  # Horizontal flip probability
     mosaic: Optional[float] = None  # Mosaic augmentation probability
     mixup: Optional[float] = None  # Mixup augmentation probability
+    # Dataset caching
+    cache: Optional[str] = None  # 'ram', 'disk', or None (false)
 
 
 class ClassCreate(BaseModel):
@@ -1708,6 +1710,7 @@ async def start_training(project_id: str, request: TrainingRequest, db: Session 
             fliplr=request.fliplr,
             mosaic=request.mosaic,
             mixup=request.mixup,
+            cache=request.cache,
         )
         training_id = training_info.get('training_id')
         print(f"[Training] Training started successfully. Training ID: {training_id}")
@@ -2592,12 +2595,68 @@ def stop_training(project_id: str, training_id: Optional[str] = Query(None), db:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     success = training_service.stop_training(project_id, training_id)
     if not success:
         raise HTTPException(status_code=400, detail="No active running training found")
-    
+
     return {"message": "Training stopped"}
+
+@router.post("/projects/{project_id}/train/pause")
+def pause_training(project_id: str, training_id: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    """Pause training (optionally pass training_id; defaults to pausing current active training)"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    success = training_service.pause_training(project_id, training_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to pause training")
+
+    return {"message": "Training paused"}
+
+@router.post("/projects/{project_id}/train/continue")
+def continue_training(project_id: str, training_id: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    """Continue paused training (optionally pass training_id; defaults to continuing first paused training)"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    success = training_service.continue_training(project_id, training_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to continue training")
+
+    return {"message": "Training continued"}
+
+class ResumeTrainingRequest(BaseModel):
+    """Request body for resuming training"""
+    additional_epochs: Optional[int] = None
+    device: Optional[str] = None
+
+@router.post("/projects/{project_id}/train/{training_id}/resume")
+async def resume_training(
+    project_id: str,
+    training_id: str,
+    request: ResumeTrainingRequest,
+    db: Session = Depends(get_db)
+):
+    """Resume training from a previous training checkpoint"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        result = training_service.resume_training(
+            project_id=project_id,
+            training_id=training_id,
+            additional_epochs=request.additional_epochs,
+            device=request.device,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 @router.post("/projects/{project_id}/train/{training_id}/test")
 async def test_model(
@@ -2735,17 +2794,28 @@ async def upload_model(
     input_size: int = Form(640, ge=32, le=2048, description="Input image size"),
     num_classes: int = Form(80, ge=1, description="Number of classes"),
     class_names: Optional[str] = Form(None, description="JSON array of class names"),
+    project_id: Optional[str] = Form(None, description="Optional project ID to associate the model with"),
     db: Session = Depends(get_db)
 ):
     """
     Upload a pre-trained .pt model file to model space.
-    The model will be stored in ModelRegistry as a standalone model (not associated with any project).
+
+    The model will be stored in ModelRegistry. If project_id is provided,
+    the model will be associated with that project for quantization purposes.
+    Otherwise, it will be a standalone model.
     """
+    # Verify project exists if provided
+    project = None
+    if project_id:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+        logger.info(f"Upload will associate model with project {project_id} ({project.name})")
     # Validate file extension
     if not file.filename or not file.filename.lower().endswith('.pt'):
         raise HTTPException(status_code=400, detail="Only .pt model files are supported")
     
-    # Parse class names
+    # Parse class names (from user input or auto-detect from model)
     parsed_class_names: List[str] = []
     if class_names:
         try:
@@ -2754,6 +2824,47 @@ async def upload_model(
                 parsed_class_names = [str(x) for x in raw]
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid class_names JSON format")
+    
+    # Auto-detect num_classes and class_names from YOLO model if not provided
+    detected_num_classes = None
+    detected_class_names = None
+    try:
+        from ultralytics import YOLO
+        model = YOLO(str(file_path))
+        
+        # Method 1: Try to get from model.names
+        if hasattr(model, 'names') and model.names:
+            detected_num_classes = len(model.names)
+            # model.names is {0: 'class1', 1: 'class2', ...}
+            detected_class_names = [model.names[i] for i in range(detected_num_classes)]
+            logger.info(f"Auto-detected from model.names: {detected_num_classes} classes")
+            logger.info(f"Class names: {detected_class_names[:5]}{'...' if len(detected_class_names) > 5 else ''}")
+        
+        # Method 2: Try model.model.nc
+        elif hasattr(model, 'model') and hasattr(model.model, 'nc'):
+            detected_num_classes = model.model.nc
+            if hasattr(model.model, 'names') and model.model.names:
+                detected_class_names = [model.model.names[i] for i in range(detected_num_classes)]
+            logger.info(f"Auto-detected from model.model.nc: {detected_num_classes} classes")
+        
+        # Method 3: Try model.info()
+        else:
+            info = model.info()
+            if 'classes' in info:
+                detected_num_classes = info['classes']
+                logger.info(f"Auto-detected from model.info: {detected_num_classes} classes")
+    except Exception as e:
+        logger.warning(f"Could not auto-detect num_classes from model: {e}")
+        logger.info(f"Will use provided num_classes: {num_classes}")
+    
+    # Use detected values if available, otherwise use provided values
+    final_num_classes = detected_num_classes if detected_num_classes is not None else num_classes
+    final_class_names = detected_class_names if detected_class_names and not parsed_class_names else parsed_class_names
+    
+    if detected_num_classes is not None:
+        logger.info(f"Final num_classes: {final_num_classes} (auto-detected from model)")
+    else:
+        logger.info(f"Final num_classes: {final_num_classes} (from user input)")
     
     # Standalone models: store in standalone_models directory (will create subdirectory after getting model_id)
     upload_dir = settings.DATASETS_ROOT / "standalone_models"
@@ -2804,15 +2915,15 @@ async def upload_model(
     model_reg = ModelRegistry(
         name=model_name,
         source=source_type,
-        project_id=None,  # Standalone models are not associated with any project
+        project_id=project_id,  # Associate with project if provided
         training_id=None,
         model_type=final_model_type,
         format="pt",
         model_path=str(file_path.resolve()),
         input_width=input_size,
         input_height=input_size,
-        num_classes=num_classes,
-        class_names=json.dumps(parsed_class_names) if parsed_class_names else None,
+        num_classes=final_num_classes,
+        class_names=json.dumps(final_class_names) if final_class_names else None,
     )
     
     db.add(model_reg)
@@ -2834,14 +2945,366 @@ async def upload_model(
         # If move fails, keep using original path
         pass
     
-    logger.info(f"Uploaded model: {model_name} (ID: {model_reg.id}, Path: {file_path})")
-    
-    return {
+    logger.info(f"Uploaded model: {model_name} (ID: {model_reg.id}, Path: {file_path}, Project: {project_id or 'None'})")
+
+    result = {
         "model_id": model_reg.id,
         "model_name": model_name,
         "file_path": str(file_path),
+        "source": source_type,
+        "project_id": project_id,
+        "project_name": project.name if project else None,
         "message": "Model uploaded successfully"
     }
+
+    if project_id:
+        result["message"] = f"Model uploaded and associated with project '{project.name}'"
+
+    return result
+
+
+@router.patch("/models/{model_id}/associate")
+async def associate_model_to_project(
+    model_id: int,
+    project_id: str = Form(..., description="Project ID to associate the model with"),
+    db: Session = Depends(get_db)
+):
+    """
+    Associate a standalone model to a project.
+
+    This allows standalone models (uploaded .pt files) to be quantized using
+    the project's calibration images.
+
+    Args:
+        model_id: Model ID
+        project_id: Project ID to associate with
+
+    Returns:
+        Updated model information with project details
+    """
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Update model association
+    model.project_id = project_id
+    # Keep source as 'standalone' or change to 'import' - keeping 'standalone'
+    # to distinguish from models that were trained within the project
+    db.commit()
+    db.refresh(model)
+
+    logger.info(f"Associated model {model_id} ({model.name}) to project {project_id} ({project.name})")
+
+    return {
+        "model_id": model.id,
+        "name": model.name,
+        "project_id": model.project_id,
+        "project_name": project.name,
+        "source": model.source,
+        "message": "Model associated to project successfully"
+    }
+
+
+@router.patch("/models/{model_id}/dissociate")
+async def dissociate_model_from_project(
+    model_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Remove project association from a model, reverting it to standalone.
+
+    Args:
+        model_id: Model ID
+
+    Returns:
+        Updated model information
+    """
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    old_project_id = model.project_id
+
+    model.project_id = None
+    model.source = "standalone"
+    db.commit()
+    db.refresh(model)
+
+    logger.info(f"Dissociated model {model_id} ({model.name}) from project {old_project_id}")
+
+    return {
+        "model_id": model.id,
+        "name": model.name,
+        "project_id": None,
+        "source": model.source,
+        "message": "Model dissociated from project"
+    }
+
+
+@router.post("/models/associate/batch")
+async def batch_associate_models(
+    model_ids: str = Form(..., description="Comma-separated list of model IDs"),
+    project_id: str = Form(..., description="Project ID to associate models with"),
+    db: Session = Depends(get_db)
+):
+    """
+    Batch associate multiple models to the same project.
+
+    Args:
+        model_ids: Comma-separated list of model IDs (e.g., "1,2,3")
+        project_id: Project ID
+
+    Returns:
+        Success/failure statistics
+    """
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Parse model IDs
+    try:
+        model_id_list = [int(mid.strip()) for mid in model_ids.split(",") if mid.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid model IDs format. Use comma-separated integers.")
+
+    if not model_id_list:
+        raise HTTPException(status_code=400, detail="No model IDs provided")
+
+    success_count = 0
+    failed_models = []
+
+    for model_id in model_id_list:
+        model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+        if model:
+            model.project_id = project_id
+            # Keep source unchanged
+            success_count += 1
+        else:
+            failed_models.append(model_id)
+
+    db.commit()
+
+    logger.info(f"Batch associated {success_count}/{len(model_id_list)} models to project {project_id}")
+
+    return {
+        "total": len(model_id_list),
+        "success": success_count,
+        "failed": len(failed_models),
+        "failed_models": failed_models,
+        "project_id": project_id,
+        "project_name": project.name
+    }
+
+
+@router.post("/models/{model_id}/calibration/upload")
+async def upload_calibration_images(
+    model_id: int,
+    request: Request,
+    file: UploadFile = File(..., description="ZIP file containing calibration images"),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload calibration images ZIP file for model quantization.
+
+    This endpoint allows users to upload a ZIP file containing calibration images
+    for standalone models that are not associated with any project. The uploaded
+    images will be used during quantization instead of project images.
+
+    Args:
+        model_id: Model ID
+        file: ZIP file containing calibration images (supports jpg, jpeg, png)
+
+    Returns:
+        Upload result information with image count
+    """
+    # Verify model exists
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    # Validate file type
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    if not file.filename.lower().endswith('.zip'):
+        raise HTTPException(status_code=400, detail="Only ZIP files are supported for calibration images")
+
+    # Create calibration images directory
+    calib_dir = settings.DATASETS_ROOT / "calibration_images" / str(model_id)
+    calib_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear existing calibration images for this model
+    for existing_file in calib_dir.glob("*"):
+        if existing_file.is_file():
+            existing_file.unlink()
+
+    # Save uploaded ZIP file
+    temp_zip_path = calib_dir / "temp_upload.zip"
+    try:
+        content = await file.read()
+        with open(temp_zip_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        logger.error(f"Failed to save uploaded calibration images: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
+
+    # Extract and validate images
+    extracted_count = 0
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+
+    try:
+        with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+            # First pass: validate the ZIP structure
+            file_list = zip_ref.namelist()
+            image_files = [f for f in file_list if f.lower().endswith(valid_extensions)]
+
+            if not image_files:
+                temp_zip_path.unlink()
+                raise HTTPException(
+                    status_code=400,
+                    detail="No valid images found in ZIP file. Supported formats: jpg, jpeg, png"
+                )
+
+            # Second pass: extract images
+            for file_info in zip_ref.infolist():
+                if file_info.is_dir():
+                    continue
+
+                file_name = file_info.filename
+                if not file_name.lower().endswith(valid_extensions):
+                    continue
+
+                # Extract to temporary location first to handle directory structure
+                zip_ref.extract(file_info, calib_dir)
+
+                # Find the extracted file and move to root of calib_dir if needed
+                extracted_path = calib_dir / file_name
+                if extracted_path.exists():
+                    # Create a clean filename
+                    base_name = Path(file_name).name
+                    # If filename has duplicates, add a suffix
+                    dest_name = base_name
+                    counter = 1
+                    while (calib_dir / dest_name).exists() and (calib_dir / dest_name) != extracted_path:
+                        stem = Path(base_name).stem
+                        ext = Path(base_name).suffix
+                        dest_name = f"{stem}_{counter}{ext}"
+                        counter += 1
+
+                    # Move to root of calib_dir
+                    final_path = calib_dir / dest_name
+                    if final_path != extracted_path:
+                        shutil.move(str(extracted_path), str(final_path))
+
+                    extracted_count += 1
+
+    except zipfile.BadZipFile:
+        temp_zip_path.unlink()
+        raise HTTPException(status_code=400, detail="Invalid ZIP file format")
+    except Exception as e:
+        logger.error(f"Failed to extract calibration images: {e}", exc_info=True)
+        temp_zip_path.unlink()
+        raise HTTPException(status_code=500, detail=f"Failed to extract ZIP file: {str(e)}")
+    finally:
+        # Clean up temporary ZIP file
+        if temp_zip_path.exists():
+            temp_zip_path.unlink()
+
+    # Clean up empty directories
+    for item in calib_dir.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+
+    if extracted_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid images were extracted from the ZIP file"
+        )
+
+    logger.info(f"Uploaded {extracted_count} calibration images for model {model_id}")
+
+    return {
+        "model_id": model_id,
+        "model_name": model.name,
+        "calibration_images_count": extracted_count,
+        "calibration_path": str(calib_dir),
+        "message": f"Successfully uploaded {extracted_count} calibration images"
+    }
+
+
+def _validate_quantization_params(
+    json_config: dict,
+    num_classes: int,
+    input_size: int,
+) -> tuple[bool, list[str]]:
+    """
+    Validate quantization parameters are reasonable.
+
+    Args:
+        json_config: Generated NE301 JSON configuration
+        num_classes: Expected number of classes
+        input_size: Input image size
+
+    Returns:
+        Tuple of (is_valid, issues) where issues is a list of error/warning messages
+    """
+    try:
+        output_spec = json_config["output_spec"]["outputs"][0]
+        scale = output_spec["scale"]
+        zero_point = output_spec["zero_point"]
+        height = output_spec["height"]
+        width = output_spec["width"]
+
+        issues = []
+        warnings = []
+
+        # Check scale range (typical YOLOv8 int8 output scale: 0.001 ~ 0.01)
+        if not (0.0005 <= scale <= 0.02):
+            issues.append(f"output_scale ({scale}) outside normal range [0.0005, 0.02]")
+
+        # Check zero_point (int8 typically -128 to 127)
+        if zero_point not in [-128, 0, 128]:
+            warnings.append(f"output_zero_point ({zero_point}) has unusual value (expected -128, 0, or 128)")
+
+        # Check output dimensions (YOLOv8 at 320x320 should be 34x2100)
+        expected_height = 4 + num_classes  # 4 bbox coords + class scores
+        if height != expected_height:
+            warnings.append(f"output height ({height}) differs from expected ({expected_height})")
+
+        # Check total boxes based on input size
+        expected_boxes_map = {
+            256: 1344,  # 3 * (32*32 + 16*16 + 8*8)
+            320: 2100,  # 3 * (40*40 + 20*20 + 10*10)
+            416: 3549,  # 3 * (52*52 + 26*26 + 13*13)
+            640: 8400,  # 3 * (80*80 + 40*40 + 20*20)
+        }
+        expected_width = expected_boxes_map.get(input_size)
+        if expected_width and width != expected_width:
+            warnings.append(f"output width ({width}) differs from expected {expected_width} for {input_size}x{input_size} input")
+
+        # Log all findings
+        if issues:
+            logger.error("Quantization parameter validation FAILED:")
+            for issue in issues:
+                logger.error(f"  ❌ {issue}")
+        if warnings:
+            logger.warning("Quantization parameter validation warnings:")
+            for warning in warnings:
+                logger.warning(f"  ⚠️  {warning}")
+
+        # Critical validation only fails on scale issues
+        is_valid = len(issues) == 0
+
+        return is_valid, issues + warnings
+    except Exception as e:
+        logger.error(f"Quantization validation error: {e}", exc_info=True)
+        return False, [str(e)]
 
 
 @router.post("/models/{model_id}/quantize/ne301")
@@ -2882,18 +3345,55 @@ async def quantize_model_to_ne301(
         except json.JSONDecodeError:
             pass
     
-    num_classes = model_reg.num_classes or len(class_names) or 80
-    
+    # Determine class names and number of classes
+    # Priority: class_names list from model metadata, then use num_classes
+    if class_names:
+        # Use class_names from model metadata
+        num_classes = len(class_names)
+        logger.info(f"Using class_names from model metadata: {num_classes} classes")
+    elif model_reg.num_classes:
+        # Use num_classes from model metadata
+        num_classes = model_reg.num_classes
+        # Generate default class names
+        class_names = [f"class_{i}" for i in range(num_classes)]
+        logger.info(f"Using num_classes from model metadata: {num_classes} classes (generated default names)")
+    else:
+        # Default to 80 classes (COCO dataset)
+        num_classes = 80
+        class_names = [f"class_{i}" for i in range(num_classes)]
+        logger.info(f"Using default: {num_classes} classes (COCO)")
+
+    # Enhanced logging for quantization configuration
+    logger.info("="*60)
+    logger.info("NE301 Quantization Configuration")
+    logger.info("="*60)
+    logger.info(f"Model ID: {model_id}")
+    logger.info(f"Model name: {model_reg.name}")
+    logger.info(f"Model format: {model_reg.format}")
+    logger.info(f"Model source: {model_reg.source}")
+    logger.info(f"Project ID: {model_reg.project_id}")
+    logger.info(f"Input size: {imgsz}x{imgsz}")
+    logger.info(f"INT8 quantization: {int8}")
+    logger.info(f"Calibration fraction: {fraction}")
+    logger.info(f"Final num_classes: {num_classes}")
+    logger.info(f"Final class_names length: {len(class_names)}")
+    class_names_preview = class_names[:3] if class_names else ['N/A']
+    logger.info(f"Class names (first 3): {class_names_preview}{'...' if len(class_names) > 3 else ''}")
+    logger.info(f"data.yaml nc field will be: {num_classes}")
+    logger.info("="*60)
+
     # Create temporary data.yaml for export (required by Ultralytics)
     temp_dir = settings.DATASETS_ROOT / "temp_quant" / str(model_id)
     temp_dir.mkdir(parents=True, exist_ok=True)
     
     data_yaml_path = temp_dir / "data.yaml"
+    # CRITICAL: Ensure nc matches the actual length of names
     data_yaml_content = {
         "path": str(temp_dir),
         "train": "images/train",
         "val": "images/val",
-        "names": class_names if class_names else {i: f"class_{i}" for i in range(num_classes)}
+        "nc": num_classes,  # This MUST match len(names)
+        "names": class_names  # Use the prepared class_names list
     }
     
     with open(data_yaml_path, "w", encoding="utf-8") as f:
@@ -2902,15 +3402,30 @@ async def quantize_model_to_ne301(
     # Create minimal calibration dataset (real data for quantization)
     calib_dir = temp_dir / "images" / "val"
     calib_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Try to find real images for calibration
+    # Search priority: 1) Uploaded calibration images, 2) Project images
     real_images_found = False
+    calib_images = []
+
     try:
-        if model_reg.project_id:
-            # Step 0: Find images for calibration
+        # Priority 1: Check for uploaded calibration images
+        uploaded_calib_dir = settings.DATASETS_ROOT / "calibration_images" / str(model_id)
+        if uploaded_calib_dir.exists():
+            logger.info(f"Found uploaded calibration images directory: {uploaded_calib_dir}")
+            valid_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+            for img_path in uploaded_calib_dir.glob("*"):
+                if img_path.is_file() and img_path.suffix.lower() in valid_extensions:
+                    calib_images.append(img_path)
+
+            if calib_images:
+                logger.info(f"Found {len(calib_images)} uploaded calibration images")
+
+        # Priority 2: Check project images if no uploaded images found
+        if not calib_images and model_reg.project_id:
             project_root = settings.DATASETS_ROOT / model_reg.project_id
-            print(f"DEBUG: Searching for images in {project_root}")
-            calib_images = []
+            logger.info(f"Searching for calibration images in project: {project_root}")
+
             # Try multiple common paths for images in YOLO projects
             img_search_paths = [
                 project_root / "images" / "val",
@@ -2921,69 +3436,98 @@ async def quantize_model_to_ne301(
                 project_root / "yolo_export" / "images",
                 project_root / "raw",
             ]
-            
+
             valid_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
             for search_path in img_search_paths:
                 if search_path.exists():
-                    print(f"DEBUG: Checking {search_path}")
                     found = [f for f in search_path.glob("*") if f.suffix.lower() in ('.jpg', '.jpeg', '.png')]
-                    print(f"DEBUG: Found {len(found)} candidate images in {search_path}")
+                    logger.info(f"Found {len(found)} candidate images in {search_path}")
                     calib_images.extend(found)
                     if len(calib_images) >= 50:
                         break
-            
-            print(f"DEBUG: Total calib images found: {len(calib_images)}")
-            
+
+            # Fallback to project's images table if filesystem search failed
             if not calib_images:
-                # Fallback to project's images table
                 from backend.models.database import Image
                 db_images = db.query(Image).filter(Image.project_id == model_reg.project_id).limit(50).all()
-                print(f"DEBUG: DB images found: {len(db_images)}")
+                logger.info(f"Found {len(db_images)} images in database")
                 for db_img in db_images:
                     img_path = Path(db_img.path)
                     if img_path.exists():
                         calib_images.append(img_path)
-            
-            # Save a subset for calibration
-            # calib_dir = temp_dir / "images" / "val" # Already defined above
-            # calib_dir.mkdir(parents=True, exist_ok=True) # Already defined above
-            print(f"DEBUG: Saving calibration images to {calib_dir}")
-            
-            if calib_images:
-                import random
-                # Randomly pick up to 20 images
-                sample_size = min(len(calib_images), 20)
-                selected_samples = random.sample(calib_images, sample_size)
-                
-                from PIL import Image as PILImage
-                for i, img_path in enumerate(selected_samples):
-                    try:
-                        with PILImage.open(img_path) as img:
-                            img = img.resize((imgsz, imgsz))
-                            img.save(calib_dir / f"calib_{i:03d}.jpg")
-                    except Exception as e:
-                        print(f"DEBUG: Failed to process {img_path}: {e}")
-                        logger.warning(f"Failed to process image {img_path} for calibration: {e}")
-                
-                if len(list(calib_dir.glob("*.jpg"))) > 0:
-                    real_images_found = True
-                    logger.info(f"Using {len(list(calib_dir.glob('*.jpg')))} real images for calibration")
-            else:
-                print("DEBUG: NO CALIBRATION IMAGES FOUND! Falling back to fake data (via config if possible)")
+
+        # Process calibration images
+        logger.info(f"Saving calibration images to {calib_dir}")
+
+        if calib_images:
+            import random
+            # Randomly pick up to 20 images
+            sample_size = min(len(calib_images), 20)
+            selected_samples = random.sample(calib_images, sample_size)
+
+            from PIL import Image as PILImage
+            for i, img_path in enumerate(selected_samples):
+                try:
+                    with PILImage.open(img_path) as img:
+                        img = img.resize((imgsz, imgsz))
+                        img.save(calib_dir / f"calib_{i:03d}.jpg")
+                except Exception as e:
+                    logger.warning(f"Failed to process image {img_path} for calibration: {e}")
+
+            if len(list(calib_dir.glob("*.jpg"))) > 0:
+                real_images_found = True
+                logger.info(f"Using {len(list(calib_dir.glob('*.jpg')))} real images for calibration")
+        else:
+            logger.warning("No calibration images found")
+
     except Exception as e:
         logger.warning(f"Error while searching for real calibration images: {e}")
 
-    # Fallback to fake data only if no real images were found
+    # Fallback handling when no real calibration images found
     if not real_images_found:
-        logger.warning("No real images found for calibration, falling back to fake random data!")
-        try:
-            import numpy as np
-            from PIL import Image
-            for i in range(10):  # Generate 10 fake images
-                fake_img = Image.fromarray(np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8))
-                fake_img.save(calib_dir / f"calib_{i:03d}.jpg")
-        except Exception as e:
-            logger.error(f"Could not generate fake calibration images: {e}")
+        # Check if uploaded calibration images directory exists but is empty
+        uploaded_calib_dir = settings.DATASETS_ROOT / "calibration_images" / str(model_id)
+        has_uploaded_calib = uploaded_calib_dir.exists()
+
+        # For standalone models (not associated with a project), this is a critical issue
+        is_standalone = model_reg.source == "standalone" or not model_reg.project_id
+
+        if is_standalone:
+            # Provide a clear error message for standalone models
+            suggestions = []
+            if has_uploaded_calib:
+                suggestions.append("The uploaded calibration images directory exists but appears to be empty or contains no valid images")
+            suggestions.extend([
+                "Upload calibration images (ZIP file with jpg/png images)",
+                "Associate the model to a project that has image data",
+                "Use manual quantization workflow with proper calibration images"
+            ])
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "no_calibration_data_for_standalone_model",
+                    "message": "Standalone models require real calibration images for accurate quantization. "
+                              "Using fake random data will produce incorrect quantization parameters.",
+                    "suggestions": suggestions,
+                    "quantization_issue": "Without real calibration data, the output_scale parameter "
+                                          "will be calculated incorrectly, leading to invalid detection results."
+                }
+            )
+        else:
+            # For project models, try to be more helpful
+            logger.warning(f"No calibration images found for project model {model_id}")
+            if model_reg.project_id:
+                logger.warning(f"Searched project paths for {model_reg.project_id}")
+            logger.warning("Proceeding with fake data - quantization quality may be poor!")
+            try:
+                import numpy as np
+                from PIL import Image
+                for i in range(10):  # Generate 10 fake images as last resort
+                    fake_img = Image.fromarray(np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8))
+                    fake_img.save(calib_dir / f"calib_{i:03d}.jpg")
+            except Exception as e:
+                logger.error(f"Could not generate fake calibration images: {e}")
     
     try:
         # Step 1: Export to TFLite
@@ -3119,7 +3663,34 @@ async def quantize_model_to_ne301(
         json_file_path = json_output_dir / f"{model_base_name}.json"
         with open(json_file_path, "w", encoding="utf-8") as f:
             json.dump(json_config, f, indent=2, ensure_ascii=False)
-        
+
+        # Extract and validate output_scale for early detection of issues
+        output_scale = json_config["output_spec"]["outputs"][0]["scale"]
+        output_zero_point = json_config["output_spec"]["outputs"][0]["zero_point"]
+        logger.info(f"Extracted output_scale: {output_scale}, output_zero_point: {output_zero_point}")
+
+        # Check scale value is in reasonable range
+        if not (0.001 <= output_scale <= 0.01):
+            logger.warning(f"⚠️  Abnormal output_scale detected: {output_scale}")
+            logger.warning(f"   Expected range: 0.001 ~ 0.01")
+            logger.warning(f"   This may indicate incorrect quantization parameters due to:")
+            logger.warning(f"   - Missing 'nc' field in data.yaml")
+            logger.warning(f"   - Poor quality calibration data")
+            logger.warning(f"   - Model export issues")
+
+        # Run comprehensive quantization parameter validation
+        is_valid, issues = _validate_quantization_params(
+            json_config=json_config,
+            num_classes=num_classes,
+            input_size=imgsz,
+        )
+
+        if not is_valid:
+            logger.error("Quantization parameter validation failed!")
+            logger.error("The generated firmware may not work correctly.")
+            # For now, log the error but continue (allow manual testing)
+            # In production, you may want to raise HTTPException here
+
         # Step 4: Copy to NE301 project and compile
         ne301_project_path = Path(settings.NE301_PROJECT_PATH) if settings.NE301_PROJECT_PATH else Path("/workspace/ne301")
         if not ne301_project_path.exists():
@@ -7535,3 +8106,50 @@ def delete_device(device_id: str, db: Session = Depends(get_db)):
     
     return {"message": "Device deleted successfully"}
 
+
+
+@router.get("/models/{model_id}/calibration/status")
+def get_calibration_status(
+    model_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get calibration images status for a model.
+
+    Returns the count and status of calibration images uploaded for the model.
+    """
+    from backend.models.database import ModelRegistry
+    
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    calib_dir = settings.DATASETS_ROOT / "calibration_images" / str(model_id)
+
+    if calib_dir.exists():
+        # Count valid image files
+        valid_extensions = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']
+        image_files = [
+            f for f in calib_dir.iterdir()
+            if f.is_file() and f.suffix in valid_extensions
+        ]
+
+        # Get latest modification time
+        latest_mtime = None
+        if image_files:
+            latest_mtime = max([f.stat().st_mtime for f in image_files])
+
+        from datetime import datetime
+        return {
+            "model_id": model_id,
+            "exists": len(image_files) > 0,
+            "count": len(image_files),
+            "uploaded_at": datetime.fromtimestamp(latest_mtime).isoformat() if latest_mtime else None
+        }
+    else:
+        return {
+            "model_id": model_id,
+            "exists": False,
+            "count": 0,
+            "uploaded_at": None
+        }

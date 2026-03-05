@@ -539,7 +539,12 @@ class Settings(BaseSettings):
     NE301_PROJECT_PATH: str = ""  # NE301 project path (empty means use default path)
     NE301_USE_DOCKER: bool = True  # Whether to use Docker for compilation (default True)
     NE301_DOCKER_IMAGE: str = "camthink/ne301-dev:latest"  # Docker image name
-    
+
+    # NE301 auto-update configuration
+    NE301_AUTO_UPDATE: bool = True  # Whether to enable auto-update on startup
+    NE301_UPDATE_TIMEOUT: int = 30  # Update operation timeout (seconds)
+    NE301_UPDATE_STASH_CHANGES: bool = False  # Whether to auto-stash local changes
+
     class Config:
         env_file = ".env"
         case_sensitive = True
