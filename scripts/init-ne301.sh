@@ -1,10 +1,12 @@
 #!/bin/bash
 # NE301 project initialization script
 # Automatically check and clone NE301 project to the host directory on container start (if empty)
+# Also automatically pull NE301 Docker image for model compilation
 
 set -e
 
 NE301_HOST_DIR="/workspace/ne301"  # Host directory path mounted by Docker Compose
+NE301_DOCKER_IMAGE="${NE301_DOCKER_IMAGE:-camthink/ne301-dev:latest}"  # NE301 Docker image for compilation
 
 # Check if running inside a Docker container
 if [ -f "/.dockerenv" ]; then
@@ -50,5 +52,54 @@ else
         echo "[NE301 Init] NE301 project directory already exists: $NE301_DIR"
     fi
 fi
+
+# Pull NE301 Docker image for model compilation (if Docker is available)
+# Note: This section uses set +e to prevent pull failures from stopping container startup
+set +e
+if command -v docker >/dev/null 2>&1; then
+    echo "[NE301 Init] Checking NE301 Docker image: $NE301_DOCKER_IMAGE"
+    
+    # Check if image exists locally
+    if docker images -q "$NE301_DOCKER_IMAGE" 2>/dev/null | grep -q .; then
+        echo "[NE301 Init] Docker image $NE301_DOCKER_IMAGE already exists locally"
+    else
+        echo "[NE301 Init] Docker image $NE301_DOCKER_IMAGE not found, pulling..."
+        
+        # Detect system architecture for cross-platform support
+        ARCH=$(uname -m)
+        PLATFORM_FLAG=""
+        if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+            # ARM64 architecture needs to pull AMD64 image (using --platform)
+            PLATFORM_FLAG="--platform linux/amd64"
+            echo "[NE301 Init] Detected ARM64 architecture, pulling AMD64 image for compatibility"
+        fi
+        
+        # Pull Docker image (with timeout if available, don't fail if pull fails - image might be pulled later)
+        PULL_CMD="docker pull $PLATFORM_FLAG $NE301_DOCKER_IMAGE"
+        if command -v timeout >/dev/null 2>&1; then
+            # Use timeout if available (5 minutes timeout)
+            if timeout 300 $PULL_CMD 2>&1; then
+                echo "[NE301 Init] Successfully pulled Docker image: $NE301_DOCKER_IMAGE"
+            else
+                echo "[NE301 Init] Warning: Failed to pull Docker image $NE301_DOCKER_IMAGE (timeout or error)"
+                echo "[NE301 Init] This may cause NE301 model compilation to fail. Please check network connection and try again."
+                echo "[NE301 Init] You can manually pull the image later with: docker pull $PLATFORM_FLAG $NE301_DOCKER_IMAGE"
+            fi
+        else
+            # Fallback: pull without timeout (may hang if network is slow)
+            if $PULL_CMD 2>&1; then
+                echo "[NE301 Init] Successfully pulled Docker image: $NE301_DOCKER_IMAGE"
+            else
+                echo "[NE301 Init] Warning: Failed to pull Docker image $NE301_DOCKER_IMAGE"
+                echo "[NE301 Init] This may cause NE301 model compilation to fail. Please check network connection and try again."
+                echo "[NE301 Init] You can manually pull the image later with: docker pull $PLATFORM_FLAG $NE301_DOCKER_IMAGE"
+            fi
+        fi
+    fi
+else
+    echo "[NE301 Init] Warning: Docker command not found, skipping image pull"
+    echo "[NE301 Init] NE301 model compilation requires Docker. Please ensure Docker is installed and accessible."
+fi
+set -e  # Re-enable error exit
 
 echo "[NE301 Init] Done"

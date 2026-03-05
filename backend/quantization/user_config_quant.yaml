@@ -10,5 +10,6 @@ quantization:
   quantization_output_type: int8
   calib_dataset_path: ./calibration_dataset
   export_path: ./quantized_models
+  max_calib_images: 200  # Maximum number of calibration images to use (prevents memory issues)
 pre_processing:
   rescaling: {scale: 255, offset: 0}

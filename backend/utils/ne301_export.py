@@ -144,6 +144,7 @@ def generate_ne301_json_config(
     max_detections: int = 300,
     total_boxes: Optional[int] = None,
     output_shape: Optional[Tuple[int, int, int]] = None,
+    alignment_requirement: int = 8,  # Memory alignment requirement (8 is most flexible and reduces fragmentation, 16/32 may cause issues with some models)
 ) -> Dict:
     """
     Generate NE301 JSON configuration file
@@ -161,6 +162,9 @@ def generate_ne301_json_config(
         max_detections: Maximum number of detections
         total_boxes: Total number of boxes (if None, will estimate from output_shape or based on input_size)
         output_shape: Model output shape (batch, height, width), if None will try to extract from TFLite model
+        alignment_requirement: Memory alignment requirement in bytes (default 8). 
+                              Lower values (8) reduce fragmentation and improve allocation success rate for large models.
+                              Higher values (16, 32, 64) may be required for some hardware but can cause fragmentation issues.
     
     Returns:
         JSON configuration dictionary
@@ -217,6 +221,46 @@ def generate_ne301_json_config(
         output_height = 4 + num_classes
         logger.warning(f"Output height {output_height} is less than expected (4 + {num_classes}), using calculated value")
     
+    # Calculate memory pool sizes based on model file size to avoid over-allocation
+    # This prevents memory fragmentation issues caused by allocating too much memory
+    model_file_size = tflite_path.stat().st_size if tflite_path.exists() else 0
+    logger.info(f"[NE301] Model file size: {model_file_size / (1024*1024):.2f} MB")
+    
+    # Calculate memory pools based on model size with reasonable multipliers
+    # exec_memory_pool: for execution buffers (typically 2-3x model size + input/output buffers)
+    # ext_memory_pool: for external memory (typically 4-6x model size for intermediate activations)
+    # Use minimum values to ensure small models work, and scale up for larger models
+    if model_file_size > 0:
+        # Base calculation: model size * multiplier + fixed overhead for input/output buffers
+        # Input buffer: input_size * input_size * 3 (RGB) * 1 byte = ~200KB for 256x256
+        input_buffer_size = input_size * input_size * 3
+        # Output buffer: total_boxes * output_height * 1 byte = ~100-500KB typically
+        output_buffer_size = total_boxes * output_height
+        
+        # exec_memory_pool: model weights + input/output buffers + execution overhead
+        # Use 3x model size + buffers + 50MB overhead for execution
+        exec_memory_pool = max(
+            1073741824,  # Minimum 1GB
+            int(model_file_size * 3 + input_buffer_size + output_buffer_size + 50 * 1024 * 1024)
+        )
+        # Cap at 2GB to prevent over-allocation
+        exec_memory_pool = min(exec_memory_pool, 2147483648)
+        
+        # ext_memory_pool: for intermediate activations during inference
+        # Use 5x model size + buffers + 100MB overhead
+        ext_memory_pool = max(
+            2147483648,  # Minimum 2GB
+            int(model_file_size * 5 + input_buffer_size * 2 + output_buffer_size * 2 + 100 * 1024 * 1024)
+        )
+        # Cap at 4GB to prevent over-allocation
+        ext_memory_pool = min(ext_memory_pool, 4294967296)
+    else:
+        # Fallback to reasonable defaults if model size cannot be determined
+        exec_memory_pool = 1073741824  # 1GB
+        ext_memory_pool = 2147483648   # 2GB
+    
+    logger.info(f"[NE301] Calculated memory pools: exec={exec_memory_pool/(1024*1024):.0f}MB, ext={ext_memory_pool/(1024*1024):.0f}MB")
+    
     config = {
         "version": "1.0.0",
         "model_info": {
@@ -255,11 +299,11 @@ def generate_ne301_json_config(
             ]
         },
         "memory": {
-            "exec_memory_pool": 874512384,
+            "exec_memory_pool": exec_memory_pool,  # Dynamically calculated based on model size to prevent over-allocation
             "exec_memory_size": 1835008,
-            "ext_memory_pool": 2415919104,
+            "ext_memory_pool": ext_memory_pool,  # Dynamically calculated based on model size to prevent over-allocation
             "ext_memory_size": 301056,
-            "alignment_requirement": 32
+            "alignment_requirement": alignment_requirement  # Configurable alignment (8 is most flexible and reduces fragmentation)
         },
         "postprocess_type": "pp_od_yolo_v8_ui",  # uint8 input, int8 output (recommended)
         "postprocess_params": {

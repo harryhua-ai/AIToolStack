@@ -54,19 +54,46 @@ def main(cfg: DictConfig) -> None:
                 yield [data.astype(np.float32)]
         else:
             representative_ds_path = cfg.quantization.calib_dataset_path
-            list_of_files = os.listdir(representative_ds_path)
-            print(f"DEBUG: Found {len(list_of_files)} files in {representative_ds_path}")
-
-            valid_extensions = ('.jpg', '.jpeg', '.png')
-            samples_yielded = 0
-            for image_file in tqdm.tqdm(list_of_files):
-                if image_file.lower().endswith(valid_extensions):
-                    image = cv2.imread(os.path.join(representative_ds_path, image_file))
+            # Get max calibration images from config, default to 200 to prevent memory issues
+            max_calib_images = cfg.quantization.get("max_calib_images", 200)
+            
+            # Get all image files
+            image_extensions = (".jpg", ".jpeg", ".png", ".bmp")
+            list_of_files = [
+                f for f in os.listdir(representative_ds_path)
+                if f.lower().endswith(image_extensions)
+            ]
+            
+            total_files = len(list_of_files)
+            
+            # Limit the number of images to prevent memory issues
+            if total_files > max_calib_images:
+                # Randomly sample to get diverse calibration data
+                # Note: setup_seed(42) is already called in main(), but we ensure reproducibility here
+                random.seed(42)  # Use fixed seed for reproducibility
+                list_of_files = random.sample(list_of_files, max_calib_images)
+                print(f"Using {max_calib_images} randomly sampled images from {total_files} total image files for calibration")
+            else:
+                print(f"Using all {total_files} images for calibration")
+            
+            # Process images one by one to minimize memory usage
+            for image_file in tqdm.tqdm(list_of_files, desc="Processing calibration images"):
+                try:
+                    image_path = os.path.join(representative_ds_path, image_file)
+                    image = cv2.imread(image_path)
+                    
                     if image is None:
+                        print(f"Warning: Failed to load image {image_file}, skipping")
                         continue
+                    
+                    # Handle grayscale images
                     if len(image.shape) != 3:
                         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                    
+                    # Convert BGR to RGB
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    
+                    # Resize image
                     resized_image = cv2.resize(
                         image,
                         (
@@ -75,15 +102,24 @@ def main(cfg: DictConfig) -> None:
                         ),
                         interpolation=cv2.INTER_LINEAR,
                     )
+                    
+                    # Normalize image
                     image_data = (
                         resized_image / cfg.pre_processing.rescaling.scale
                         + cfg.pre_processing.rescaling.offset
                     )
                     img = image_data.astype(np.float32)
                     image_processed = np.expand_dims(img, 0)
-                    samples_yielded += 1
+                    
+                    # Yield processed image and clear references to free memory
                     yield [image_processed]
-            print(f"DEBUG: representative_data_gen yielded {samples_yielded} samples")
+                    
+                    # Explicitly delete large arrays to free memory immediately
+                    del image, resized_image, image_data, img, image_processed
+                    
+                except Exception as e:
+                    print(f"Warning: Error processing image {image_file}: {e}, skipping")
+                    continue
 
     configs = get_config(cfg)
 
