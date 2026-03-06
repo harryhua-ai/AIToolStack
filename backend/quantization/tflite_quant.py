@@ -160,9 +160,21 @@ def main(cfg: DictConfig) -> None:
 
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_data_gen
-
+    
+    # Enforce full integer quantization
+    print(f"DEBUG: Setting up TFLITE_BUILTINS_INT8")
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.target_spec.supported_types = [tf.int8]
+    converter.experimental_new_converter = True
+    
     # Quantize and save
-    tflite_model_quantio = converter.convert()
+    print(f"DEBUG: Starting converter.convert()... This may take a few minutes.")
+    try:
+        tflite_model_quantio = converter.convert()
+        print(f"DEBUG: converter.convert() successful. Size: {len(tflite_model_quantio)} bytes")
+    except Exception as e:
+        print(f"DEBUG: converter.convert() FAILED: {e}")
+        raise e
     tflite_model_quantio_file = (
         tflite_models_dir
         / f"{name}_{quant_tag}_{input_tag}{output_tag}_{uc}.tflite"

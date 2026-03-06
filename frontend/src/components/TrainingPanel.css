@@ -799,11 +799,15 @@
 
 .training-actions {
   display: flex;
+  justify-content: center;
   gap: var(--spacing-md);
 }
 
+.btn-pause-training,
+.btn-continue-training,
 .btn-stop-training {
-  flex: 1;
+  flex: 0 0 auto;
+  min-width: 120px;
   height: var(--btn-height-lg);
   min-height: var(--btn-height-lg);
   padding: var(--btn-padding-lg);
@@ -821,6 +825,18 @@
   gap: var(--spacing-sm);
   white-space: nowrap;
   box-sizing: border-box;
+}
+
+.btn-pause-training:hover {
+  background: #FF9800;
+  border-color: #FF9800;
+  color: white;
+}
+
+.btn-continue-training:hover {
+  background: #4CAF50;
+  border-color: #4CAF50;
+  color: white;
 }
 
 .btn-stop-training:hover {
@@ -1868,4 +1884,26 @@
   color: var(--text-light);
   font-size: var(--font-size-xs);
   word-break: break-all;
+}
+
+/* ETA 显示样式 */
+.eta-calculating {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.eta-absolute {
+  display: block;
+}
+
+.eta-relative {
+  display: block;
+  font-size: 0.85em;
+  opacity: 0.7;
+  margin-top: 2px;
+}
+
+.eta-unavailable {
+  opacity: 0.5;
+  font-style: italic;
 }

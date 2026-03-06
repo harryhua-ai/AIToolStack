@@ -56,8 +56,13 @@ The model training and quantization capabilities of this tool depend on the open
 
 ## Requirements
 
-- **Docker & docker-compose (Required)**  
-  Please refer to [Docker official installation guide](https://docs.docker.com/get-docker/) and [docker-compose guide](https://docs.docker.com/compose/install/) for deployment.
+- **Docker & Docker Compose (Required)**
+  Please refer to [Docker official installation guide](https://docs.docker.com/get-docker/) and [Docker Compose guide](https://docs.docker.com/compose/install/) for deployment.
+
+  > **Note**: This project uses Docker Compose V2 syntax (`docker compose` with space). If you prefer the old `docker-compose` command, you can add an alias:
+  > ```bash
+  > echo 'alias docker-compose="docker compose"' >> ~/.bashrc && source ~/.bashrc
+  > ```
 - **NE301 Quantization Model Package Generation**  
   Need to pre-pull the quantization environment image:
   ```
@@ -79,8 +84,8 @@ The model training and quantization capabilities of this tool depend on the open
 
 2. Deploy with Docker
    ```bash
-   docker-compose build
-   docker-compose up
+   docker compose build
+   docker compose up
    ```
 
    > **Note: Main parameters are defined in the configuration file. To customize `MQTT_BROKER_HOST`, etc., please edit the environment variables in `docker-compose.yml` and ensure the address is accessible by devices (usually use the host machine's actual IP address, not `localhost`).**
@@ -97,6 +102,14 @@ cd backend   && pip install -r requirements.txt && uvicorn main:app --reload
 - Backend API routes are in `backend/api/routes.py`
 - Frontend service configuration is in `frontend/src/config.ts`
 
+### Documentation
+
+- 📖 [Deployment Guide](docs/DEPLOYMENT.md) - Docker deployment and configuration
+- 🔧 [Development Guide](docs/DEVELOPMENT.md) - Development patterns and workflows
+- ⚙️ [Environment Variables](docs/ENV.md) - Configuration reference
+- 🤝 [Contributing](CONTRIBUTING.md) - How to contribute
+- 📝 [Changelog](CHANGELOG.md) - Recent updates and fixes
+
 ---
 
 ## Roadmap
@@ -111,7 +124,7 @@ cd backend   && pip install -r requirements.txt && uvicorn main:app --reload
 
 ## Ports & Environment Variables
 
-- **Default Ports (docker-compose)**:
+- **Default Ports (Docker Compose)**:
   - API (Backend): `8000`
   - Frontend React: `3000` (in container, proxied to backend)
 - **Main Environment Variables (Customizable)**:
@@ -119,7 +132,7 @@ cd backend   && pip install -r requirements.txt && uvicorn main:app --reload
   - `MQTT_BROKER_HOST`: MQTT Broker service hostname or IP (if devices need network access, specify the host machine's actual IP)
   - `MQTT_BROKER`, `MQTT_TOPIC`: NE301 MQTT configuration
   - `DATASETS_ROOT`: Backend dataset directory (recommended to mount for persistence)
-  - Other detailed variables can be overridden through `.env` file or docker-compose environment
+  - Other detailed variables can be overridden through `.env` file or Docker Compose environment
 
 ---
 

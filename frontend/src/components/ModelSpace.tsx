@@ -12,7 +12,7 @@ import { Alert } from '../ui/Alert';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useAlert } from '../hooks/useAlert';
 import { useConfirm } from '../hooks/useConfirm';
-import { IoEye, IoDownload, IoTrash, IoChevronBack, IoChevronForward, IoPlay, IoClose, IoImage, IoFolderOpen, IoCloudUpload, IoFlash, IoAdd, IoRemove } from 'react-icons/io5';
+import { IoEye, IoDownload, IoTrash, IoChevronBack, IoChevronForward, IoPlay, IoClose, IoImage, IoFolderOpen, IoCloudUpload, IoFlash, IoAdd, IoRemove, IoLink, IoWarning, IoCheckmarkCircle, IoCheckmarkDone } from 'react-icons/io5';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogBody, DialogFooter, DialogClose } from '../ui/Dialog';
 
 interface ModelRecord {
@@ -52,7 +52,7 @@ interface ModelSpaceProps {
 
 export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
   const { t } = useTranslation();
-  const { alertState, showSuccess, showError, showWarning, showInfo, closeAlert } = useAlert();
+  const { alertState, showSuccess, showError, showWarning, closeAlert } = useAlert();
   const { confirmState, showConfirm, closeConfirm } = useConfirm();
   const [models, setModels] = useState<ModelRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -76,23 +76,43 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadModelName, setUploadModelName] = useState('');
+  const [uploadCalibrationFile, setUploadCalibrationFile] = useState<File | null>(null);
   const [uploadModelType, setUploadModelType] = useState('yolov8n');
   const [uploadInputSize, setUploadInputSize] = useState(640);
   const [uploadInputSizeInput, setUploadInputSizeInput] = useState('640');
-  const [uploadNumClasses, setUploadNumClasses] = useState(80);
-  const [uploadNumClassesInput, setUploadNumClassesInput] = useState('80');
+  const [uploadNumClasses, setUploadNumClasses] = useState(0);  // Default to 0, user must set correct value
+  const [uploadNumClassesInput, setUploadNumClassesInput] = useState('0');
   const [uploadClassNamesList, setUploadClassNamesList] = useState<string[]>([]);
   const [newClassName, setNewClassName] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [classNamesInputMode, setClassNamesInputMode] = useState<'manual' | 'json'>('manual');
   const [classNamesJsonInput, setClassNamesJsonInput] = useState('');
+  const [uploadSelectedProject, setUploadSelectedProject] = useState<string | null>(null);
+  const [isLoadingUploadProjects, setIsLoadingUploadProjects] = useState(false);
+  const [uploadProjects, setUploadProjects] = useState<any[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const calibrationInputRef = useRef<HTMLInputElement>(null);
   const [showQuantizeModal, setShowQuantizeModal] = useState(false);
   const [quantizeTarget, setQuantizeTarget] = useState<ModelRecord | null>(null);
   const [isQuantizing, setIsQuantizing] = useState(false);
   const [quantizeInputSize, setQuantizeInputSize] = useState(256);
   const [quantizeInputSizeInput, setQuantizeInputSizeInput] = useState('256');
   const [filterModelType, setFilterModelType] = useState<string>('all');
+
+  // Calibration image upload states
+  const [calibrationFile, setCalibrationFile] = useState<File | null>(null);
+  const [isUploadingCalibration, setIsUploadingCalibration] = useState(false);
+
+  // Calibration status for quantize dialog
+  const [calibrationImagesCount, setCalibrationImagesCount] = useState(0);
+  const [hasCalibrationImages, setHasCalibrationImages] = useState(false);
+  const [loadingCalibrationStatus, setLoadingCalibrationStatus] = useState(false);
+
+  // Model association states
+  const [showAssociateModal, setShowAssociateModal] = useState(false);
+  const [selectedModelForAssociate, setSelectedModelForAssociate] = useState<ModelRecord | null>(null);
+  const [projects, setProjects] = useState<any[]>([]);
+  const [isLoadingProjects, setIsLoadingProjects] = useState(false);
 
 
   const fetchModels = useCallback(async () => {
@@ -117,6 +137,14 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
   useEffect(() => {
     fetchModels();
   }, [fetchModels]);
+
+  // Auto-update num_classes when class names list changes
+  useEffect(() => {
+    if (uploadClassNamesList.length > 0) {
+      setUploadNumClasses(uploadClassNamesList.length);
+      setUploadNumClassesInput(uploadClassNamesList.length.toString());
+    }
+  }, [uploadClassNamesList]);
 
 
   const filteredModels = useMemo(() => {
@@ -343,29 +371,61 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
       setShowUploadModal(true);
       // Reset form when opening
       setUploadInputSizeInput('640');
-      setUploadNumClassesInput('80');
+      setUploadNumClassesInput('0');  // Default to 0, requires user input
       setClassNamesInputMode('manual');
       setClassNamesJsonInput('');
+      setUploadSelectedProject(null);
+      // Fetch projects for selector
+      fetchUploadProjects();
     } else {
       setShowUploadModal(false);
       // Reset form when closing
       setUploadFile(null);
+      setUploadCalibrationFile(null);
       setUploadModelName('');
       setUploadModelType('yolov8n');
       setUploadInputSize(640);
       setUploadInputSizeInput('640');
-      setUploadNumClasses(80);
+      setUploadNumClasses(0);
       setUploadNumClassesInput('80');
       setUploadClassNamesList([]);
       setNewClassName('');
       setClassNamesInputMode('manual');
       setClassNamesJsonInput('');
+      setUploadSelectedProject(null);
+
+      // Reset file input
+      if (calibrationInputRef.current) {
+        calibrationInputRef.current.value = '';
+      }
     }
   }, []);
+
+  const fetchUploadProjects = async () => {
+    setIsLoadingUploadProjects(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/projects`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      setUploadProjects(data || []);
+    } catch (err: any) {
+      console.error('Failed to fetch projects:', err);
+      // Don't show error for project fetch failure - it's optional
+    } finally {
+      setIsLoadingUploadProjects(false);
+    }
+  };
 
   const handleUpload = async () => {
     if (!uploadFile || !uploadModelName.trim()) {
       showWarning(t('modelSpace.uploadRequired', '请选择模型文件并输入模型名称'));
+      return;
+    }
+
+    if (uploadNumClasses < 1) {
+      showWarning(t('modelSpace.numClassesRequired', '请输入有效的类别数（至少为 1）'));
       return;
     }
 
@@ -377,9 +437,14 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
       formData.append('model_type', uploadModelType);
       formData.append('input_size', uploadInputSize.toString());
       formData.append('num_classes', uploadNumClasses.toString());
-      
+
       if (uploadClassNamesList.length > 0) {
         formData.append('class_names', JSON.stringify(uploadClassNamesList));
+      }
+
+      // Add project_id if a project is selected
+      if (uploadSelectedProject) {
+        formData.append('project_id', uploadSelectedProject);
       }
 
       const response = await fetch(`${API_BASE_URL}/models/upload`, {
@@ -389,20 +454,58 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
 
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
-        throw new Error(error.detail || t('modelSpace.uploadFailed', '上传失败'));
+        const errorMessage = typeof error.detail === 'string'
+          ? error.detail
+          : JSON.stringify(error.detail || error);
+        throw new Error(errorMessage || t('modelSpace.uploadFailed', '上传失败'));
       }
 
       const data = await response.json();
-      showSuccess(t('modelSpace.uploadSuccess', '模型上传成功'));
-      
-      // Reset form
+      if (data.project_name) {
+        showSuccess(t('modelSpace.uploadSuccessWithProject', '模型上传成功，已关联到项目') + `: ${data.project_name}`);
+      } else {
+        showSuccess(t('modelSpace.uploadSuccess', '模型上传成功'));
+      }
+
+      // 3. Upload calibration images if selected
+      if (uploadCalibrationFile && data.model_id) {
+        try {
+          const calibFormData = new FormData();
+          calibFormData.append('file', uploadCalibrationFile);
+
+          const calibResponse = await fetch(
+            `${API_BASE_URL}/models/${data.model_id}/calibration/upload`,
+            {
+              method: 'POST',
+              body: calibFormData,
+            }
+          );
+
+          if (calibResponse.ok) {
+            const calibData = await calibResponse.json();
+            showSuccess(t('modelSpace.calibrationUploadSuccess', '已上传 {{count}} 张校准图片', { count: calibData.calibration_images_count }));
+          } else {
+            const error = await calibResponse.json().catch(() => ({}));
+            console.error('Failed to upload calibration images:', error);
+            showWarning(t('modelSpace.calibrationUploadFailed', '校准图片上传失败'));
+          }
+        } catch (err) {
+          console.error('Failed to upload calibration images:', err);
+          // Don't block main flow, just show warning
+          showWarning(t('modelSpace.calibrationUploadFailed', '校准图片上传失败'));
+        }
+      }
+
+      // 4. Reset form
       setUploadFile(null);
+      setUploadCalibrationFile(null);
       setUploadModelName('');
       setUploadModelType('yolov8n');
       setUploadInputSize(640);
-      setUploadNumClasses(80);
+      setUploadNumClasses(0);
       setUploadClassNamesList([]);
       setNewClassName('');
+      setUploadSelectedProject(null);
       setShowUploadModal(false);
       
       // Refresh model list
@@ -415,6 +518,27 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
     }
   };
 
+  // Check calibration images status when opening quantize dialog
+  const checkCalibrationStatus = async (modelId: number) => {
+    if (!modelId) return;
+
+    setLoadingCalibrationStatus(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/models/${modelId}/calibration/status`);
+      if (response.ok) {
+        const data = await response.json();
+        setCalibrationImagesCount(data.count || 0);
+        setHasCalibrationImages(data.exists || false);
+      }
+    } catch (err) {
+      console.error('Failed to check calibration status:', err);
+      setCalibrationImagesCount(0);
+      setHasCalibrationImages(false);
+    } finally {
+      setLoadingCalibrationStatus(false);
+    }
+  };
+
   const handleQuantize = (model: ModelRecord) => {
     if (!model.model_id || model.format?.toLowerCase() !== 'pt') {
       showWarning(t('modelSpace.quantizeOnlyPt', '只能量化 .pt 模型'));
@@ -424,6 +548,8 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
     // Default quantization input size is always 256
     setQuantizeInputSize(256);
     setQuantizeInputSizeInput('256');
+    // Check calibration images status when opening quantize dialog
+    checkCalibrationStatus(model.model_id);
     setShowQuantizeModal(true);
   };
 
@@ -434,6 +560,39 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
 
     setIsQuantizing(true);
     try {
+      // Upload calibration images if provided
+      if (calibrationFile) {
+        setIsUploadingCalibration(true);
+        try {
+          const calibFormData = new FormData();
+          calibFormData.append('file', calibrationFile);
+
+          const uploadResponse = await fetch(
+            `${API_BASE_URL}/models/${quantizeTarget.model_id}/calibration/upload`,
+            {
+              method: 'POST',
+              body: calibFormData,
+            }
+          );
+
+          if (!uploadResponse.ok) {
+            const error = await uploadResponse.json().catch(() => ({}));
+            const errorMessage = typeof error.detail === 'string'
+              ? error.detail
+              : JSON.stringify(error.detail || error);
+            throw new Error(errorMessage || t('modelSpace.calibrationUploadFailed', '校准图片上传失败'));
+          }
+
+          const uploadData = await uploadResponse.json();
+          showSuccess(t('modelSpace.calibrationUploadSuccess', '已上传 {{count}} 张校准图片', { count: uploadData.calibration_images_count }));
+          setIsUploadingCalibration(false);
+          setIsQuantizing(false);
+          return;
+        } finally {
+          setIsUploadingCalibration(false);
+        }
+      }
+
       const params = new URLSearchParams({
         imgsz: quantizeInputSize.toString(),
         int8: 'true',
@@ -449,16 +608,20 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
 
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
-        throw new Error(error.detail || t('modelSpace.quantizeFailed', '量化失败'));
+        const errorMessage = typeof error.detail === 'string'
+          ? error.detail
+          : JSON.stringify(error.detail || error);
+        throw new Error(errorMessage || t('modelSpace.quantizeFailed', '量化失败'));
       }
 
       const data = await response.json();
       showSuccess(t('modelSpace.quantizeSuccess', '模型量化成功'));
-      
+
       setShowQuantizeModal(false);
       setQuantizeTarget(null);
       setQuantizeInputSize(256);
       setQuantizeInputSizeInput('256');
+      setCalibrationFile(null);
 
       // Refresh model list
       await fetchModels();
@@ -467,6 +630,94 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
       showError(err.message || t('modelSpace.quantizeFailed', '量化失败'));
     } finally {
       setIsQuantizing(false);
+    }
+  };
+
+  const handleAssociateToProject = (model: ModelRecord) => {
+    setSelectedModelForAssociate(model);
+    setShowAssociateModal(true);
+    fetchProjects();
+  };
+
+  const handleDissociateFromProject = async (model: ModelRecord) => {
+    if (!model.model_id) return;
+
+    showConfirm(
+      t('modelSpace.dissociateConfirmMessage', '确定要取消该模型与项目的关联吗？取消后模型将变为独立模型。'),
+      async () => {
+        try {
+          const response = await fetch(`${API_BASE_URL}/models/${model.model_id}/dissociate`, {
+            method: 'PATCH',
+          });
+
+          if (!response.ok) {
+            throw new Error('Failed to dissociate model');
+          }
+
+          showSuccess(t('modelSpace.dissociateSuccess', '模型已取消关联'));
+          await fetchModels();
+        } catch (err: any) {
+          console.error('Failed to dissociate model:', err);
+          showError(err.message || t('modelSpace.dissociateFailed', '取消关联失败'));
+        }
+      },
+      {
+        title: t('modelSpace.dissociateConfirmTitle', '取消关联项目'),
+        confirmText: t('common.confirm', '确定'),
+        cancelText: t('common.cancel', '取消'),
+        variant: 'warning',
+      }
+    );
+  };
+
+  const fetchProjects = async () => {
+    setIsLoadingProjects(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/projects`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      setProjects(data || []);
+    } catch (err: any) {
+      console.error('Failed to fetch projects:', err);
+      showError(err.message || 'Failed to fetch projects');
+    } finally {
+      setIsLoadingProjects(false);
+    }
+  };
+
+  const handleProjectSelect = async (project: any) => {
+    if (!selectedModelForAssociate?.model_id) return;
+
+    try {
+      const formData = new FormData();
+      formData.append('project_id', project.id);
+
+      const response = await fetch(
+        `${API_BASE_URL}/models/${selectedModelForAssociate.model_id}/associate`,
+        {
+          method: 'PATCH',
+          body: formData,
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        const errorMessage = typeof error.detail === 'string'
+          ? error.detail
+          : JSON.stringify(error.detail || error);
+        throw new Error(errorMessage || t('modelSpace.associateFailed', '关联项目失败'));
+      }
+
+      const data = await response.json();
+      showSuccess(t('modelSpace.associateSuccess', '模型已关联到项目') + `: ${data.project_name}`);
+      setShowAssociateModal(false);
+      setSelectedModelForAssociate(null);
+      await fetchModels();
+    } catch (err: any) {
+      console.error('Failed to associate model:', err);
+      showError(err.message || t('modelSpace.associateFailed', '关联项目失败'));
     }
   };
 
@@ -511,7 +762,10 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
 
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
-        throw new Error(error.detail || t('modelSpace.testFailed', '测试失败'));
+        const errorMessage = typeof error.detail === 'string'
+          ? error.detail
+          : JSON.stringify(error.detail || error);
+        throw new Error(errorMessage || t('modelSpace.testFailed', '测试失败'));
       }
 
       const data = await response.json();
@@ -781,6 +1035,55 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                     <td className="col-actions">
                       <div className="actions-cell">
                         {/* View detail button (only for training models) */}
+                        {/* Associate to project / Dissociate button (for import/standalone/quantization models) */}
+                        {m.model_id && (m.source === 'import' || m.source === 'standalone' || m.source === 'quantization') && !m.project_id && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            className="action-btn"
+                            onClick={() => handleAssociateToProject(m)}
+                            title={t('modelSpace.associateToProject', '关联到项目')}
+                          >
+                            <IoLink />
+                          </Button>
+                        )}
+                        {m.model_id && (m.source === 'import' || m.source === 'standalone' || m.source === 'quantization') && m.project_id && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            className="action-btn"
+                            onClick={() => handleDissociateFromProject(m)}
+                            title={t('modelSpace.dissociateFromProject', '取消关联')}
+                          >
+                            <IoLink />
+                          </Button>
+                        )}
+                        {/* Browse button (for NE301 bin only) */}
+                        {m.model_id && m.format?.toLowerCase() === 'bin' && m.model_type?.toLowerCase() === 'ne301' && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            className="action-btn"
+                            onClick={() => handleBrowse(m)}
+                            title={t('modelSpace.browse', '浏览关联文件')}
+                          >
+                            <IoFolderOpen />
+                          </Button>
+                        )}
+                        {/* Quantize button (for uploaded .pt models only) */}
+                        {m.model_id && m.format?.toLowerCase() === 'pt' && (m.source === 'import' || m.source === 'standalone') && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            className="action-btn"
+                            onClick={() => handleQuantize(m)}
+                            disabled={m.status === 'running'}
+                            title={t('modelSpace.quantize', '量化为 NE301')}
+                          >
+                            <IoFlash />
+                          </Button>
+                        )}
+                        {/* View training detail button (for training models only) */}
                         {m.source === 'training' && m.project_id && m.training_id && (
                           <Button
                             variant="secondary"
@@ -805,18 +1108,6 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                             <IoPlay />
                           </Button>
                         )}
-                        {/* Browse button (for NE301 bin only) */}
-                        {m.model_id && m.format?.toLowerCase() === 'bin' && m.model_type?.toLowerCase() === 'ne301' && (
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            className="action-btn"
-                            onClick={() => handleBrowse(m)}
-                            title={t('modelSpace.browse', '浏览关联文件')}
-                          >
-                            <IoFolderOpen />
-                          </Button>
-                        )}
                         {/* Download button (for all models) */}
                         {(m.model_id || (m.project_id && m.training_id)) && (
                           <Button
@@ -828,19 +1119,6 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                             title={t('modelSpace.download', '下载模型')}
                           >
                             <IoDownload />
-                          </Button>
-                        )}
-                        {/* Quantize button (for uploaded .pt models only) */}
-                        {m.model_id && m.format?.toLowerCase() === 'pt' && (m.source === 'import' || m.source === 'standalone') && (
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            className="action-btn"
-                            onClick={() => handleQuantize(m)}
-                            disabled={m.status === 'running'}
-                            title={t('modelSpace.quantize', '量化为 NE301')}
-                          >
-                            <IoFlash />
                           </Button>
                         )}
                         {/* Delete button (for all models) */}
@@ -1310,7 +1588,56 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
             </FormField>
 
             <FormField
-              label={t('modelSpace.numClasses', '类别数量')}
+              label={t('modelSpace.associateProject', '关联项目（可选）')}
+              helpText={t('modelSpace.associateProjectHelp', '选择一个项目以使用该项目的图片进行模型量化')}
+            >
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px'
+              }}>
+                <select
+                  value={uploadSelectedProject || ''}
+                  onChange={(e) => setUploadSelectedProject(e.target.value || null)}
+                  disabled={isUploading || isLoadingUploadProjects}
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '6px',
+                    background: 'var(--bg-primary)',
+                    color: 'var(--text-primary)',
+                    fontSize: '14px',
+                    cursor: isUploading || isLoadingUploadProjects ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  <option value="">{t('modelSpace.noProject', '不关联项目')}</option>
+                  {uploadProjects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name || project.id}
+                    </option>
+                  ))}
+                </select>
+                {uploadSelectedProject && (
+                  <div style={{
+                    fontSize: '12px',
+                    color: 'var(--text-secondary)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}>
+                    <IoFolderOpen style={{ fontSize: '14px' }} />
+                    <span>
+                      {t('modelSpace.willAssociateTo', '将关联到')}: {uploadProjects.find(p => p.id === uploadSelectedProject)?.name || uploadSelectedProject}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </FormField>
+
+            {/* Number of Classes is now auto-detected from model file - field hidden */}
+            {false && <FormField
+              label={t('modelSpace.numClasses', '类别数量（从模型文件自动检测）')}
             >
               <Input
                 type="number"
@@ -1329,7 +1656,7 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                   const value = e.target.value;
                   if (value === '') {
                     setUploadNumClassesInput('80');
-                    setUploadNumClasses(80);
+                    setUploadNumClasses(0);
                   } else {
                     const numValue = parseInt(value);
                     if (Number.isNaN(numValue) || numValue < 1) {
@@ -1344,7 +1671,7 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                 disabled={isUploading}
                 min={1}
               />
-            </FormField>
+            </FormField>}
 
             <FormField
               label={t('modelSpace.classNames', '类别名称')}
@@ -1502,6 +1829,56 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                 )}
               </div>
             </FormField>
+
+            {/* Calibration Images Upload (Optional) */}
+            <FormField
+              label={t('modelSpace.uploadCalibrationImages', '上传校准图片（可选）')}
+              helpText={t('modelSpace.calibrationImagesHelp', '上传校准图片以获得更好的量化效果（推荐 20-50 张真实图片，ZIP 格式）')}
+            >
+              <div style={{
+                padding: '16px',
+                background: 'var(--bg-secondary)',
+                borderRadius: '6px',
+                border: '1px dashed var(--border-color)',
+                textAlign: 'center'
+              }}>
+                <input
+                  ref={calibrationInputRef}
+                  type="file"
+                  accept=".zip"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] || null;
+                    setUploadCalibrationFile(file);
+                  }}
+                  disabled={isUploading}
+                  style={{ display: 'none' }}
+                />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => calibrationInputRef.current?.click()}
+                    disabled={isUploading}
+                    style={{ width: '100%' }}
+                  >
+                    <IoCloudUpload style={{ marginRight: '8px' }} />
+                    {uploadCalibrationFile 
+                      ? t('modelSpace.changeFile', '更换文件')
+                      : t('modelSpace.selectCalibrationZip', '选择 ZIP 文件')}
+                  </Button>
+                  {uploadCalibrationFile && (
+                    <p style={{ marginTop: '0', color: 'var(--text-secondary)', fontSize: '14px' }}>
+                      {t('modelSpace.selectedFile', '已选择')}: {uploadCalibrationFile.name}
+                    </p>
+                  )}
+                  {!uploadCalibrationFile && (
+                    <p style={{ marginTop: '0', color: 'var(--text-secondary)', fontSize: '12px' }}>
+                      {t('modelSpace.calibrationZipFormat', '支持 .jpg, .jpeg, .png 图片')}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </FormField>
           </DialogBody>
 
           <DialogFooter className="config-modal-actions">
@@ -1541,6 +1918,7 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                 setQuantizeTarget(null);
                 setQuantizeInputSize(256);
                 setQuantizeInputSizeInput('256');
+                setCalibrationFile(null);
               }}
               disabled={isQuantizing}
             >
@@ -1628,15 +2006,147 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                     <IoFlash style={{ color: 'var(--primary-color)' }} />
                     <span>{t('modelSpace.quantizationType', '量化类型')}: int8</span>
                   </div>
-                  <p style={{ 
-                    margin: '0', 
-                    color: 'var(--text-secondary)', 
+                  <p style={{
+                    margin: '0',
+                    color: 'var(--text-secondary)',
                     fontSize: '13px',
                     lineHeight: '1.5'
                   }}>
                     {t('modelSpace.quantizeNote', '注意：量化过程可能需要几分钟时间，请耐心等待。')}
                   </p>
                 </div>
+
+                {/* Calibration Image Upload Section */}
+                <FormField
+                  label={t('modelSpace.calibrationImages', '校准图片')}
+                  helpText={t('modelSpace.calibrationImagesHelp', '上传校准图片以获得更好的量化效果（推荐 20-50 张真实图片，ZIP 格式）')}
+                >
+                  {loadingCalibrationStatus ? (
+                    <div style={{ padding: '16px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                      {t('common.loading', '加载中...')}
+                    </div>
+                  ) : hasCalibrationImages ? (
+                    <div style={{
+                      padding: '16px',
+                      background: 'var(--success-bg, rgba(34, 197, 94, 0.1))',
+                      border: '1px solid var(--success-color, #22c55e)',
+                      borderRadius: '6px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '12px'
+                    }}>
+                      <IoCheckmarkCircle style={{ color: 'var(--success-color, #22c55e)', fontSize: '20px', flexShrink: 0 }} />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: '600', marginBottom: '4px', color: 'var(--success-color, #22c55e)' }}>
+                          {t('modelSpace.calibrationImagesUploaded', '已上传校准图片')}
+                        </div>
+                        <div style={{ fontSize: '14px', color: 'var(--text-secondary)' }}>
+                          {t('modelSpace.calibrationImagesCount', '共 {{count}} 张图片', { count: calibrationImagesCount })}
+                        </div>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          setCalibrationFile(null);
+                        }}
+                        disabled={isQuantizing || isUploadingCalibration}
+                      >
+                        {t('modelSpace.reuploadCalibration', '重新上传')}
+                      </Button>
+                    </div>
+                  ) : (
+                    <div style={{
+                      padding: '16px',
+                      background: 'var(--bg-secondary)',
+                      borderRadius: '6px',
+                      border: '1px dashed var(--border-color)',
+                      textAlign: 'center'
+                    }}>
+                    <input
+                      type="file"
+                      accept=".zip"
+                      onChange={(e) => setCalibrationFile(e.target.files?.[0] || null)}
+                      disabled={isQuantizing || isUploadingCalibration}
+                      id="calibration-upload"
+                      style={{ display: 'none' }}
+                    />
+                    <label
+                      htmlFor="calibration-upload"
+                      style={{
+                        display: 'inline-flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        gap: '8px',
+                        cursor: isQuantizing || isUploadingCalibration ? 'not-allowed' : 'pointer',
+                        padding: '20px',
+                        transition: 'all 0.2s'
+                      }}
+                    >
+                      <IoCloudUpload style={{
+                        fontSize: '32px',
+                        color: 'var(--primary-color)',
+                        opacity: isQuantizing || isUploadingCalibration ? 0.5 : 1
+                      }} />
+                      <span style={{
+                        fontSize: '14px',
+                        color: 'var(--text-primary)',
+                        fontWeight: '500'
+                      }}>
+                        {calibrationFile
+                          ? calibrationFile.name
+                          : t('modelSpace.selectCalibrationZip', '选择 ZIP 文件')}
+                      </span>
+                      <span style={{
+                        fontSize: '12px',
+                        color: 'var(--text-secondary)'
+                      }}>
+                        {t('modelSpace.calibrationZipFormat', '支持 .jpg, .jpeg, .png 图片')}
+                      </span>
+                    </label>
+                    {calibrationFile && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setCalibrationFile(null);
+                          // Reset file input
+                          const fileInput = document.getElementById('calibration-upload') as HTMLInputElement;
+                          if (fileInput) fileInput.value = '';
+                        }}
+                        disabled={isQuantizing || isUploadingCalibration}
+                        style={{ marginTop: '12px' }}
+                      >
+                        {t('common.clear', '清除')}
+                      </Button>
+                    )}
+                  </div>
+                  )}
+                </FormField>
+
+                {/* Warning for standalone models without calibration */}
+                {quantizeTarget && !quantizeTarget.project_id && !calibrationFile && (
+                  <div style={{
+                    padding: '12px 16px',
+                    background: 'var(--warning-bg, rgba(245, 158, 11, 0.1))',
+                    border: '1px solid var(--warning-color, #f59e0b)',
+                    borderRadius: '6px',
+                    display: 'flex',
+                    gap: '12px',
+                    alignItems: 'flex-start'
+                  }}>
+                    <IoWarning style={{ color: 'var(--warning-color, #f59e0b)', fontSize: '20px', flexShrink: 0, marginTop: '2px' }} />
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: '600', marginBottom: '4px', color: 'var(--warning-color, #f59e0b)' }}>
+                        {t('modelSpace.noCalibrationWarningTitle', '警告')}
+                      </div>
+                      <div style={{ fontSize: '14px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
+                        {t('modelSpace.noCalibrationWarningMessage', '模型未关联项目且未上传校准图片，量化可能失败或效果不佳。建议先关联到有图片的项目或上传校准图片。')}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </DialogBody>
@@ -1649,6 +2159,7 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
                 setQuantizeTarget(null);
                 setQuantizeInputSize(256);
                 setQuantizeInputSizeInput('256');
+                setCalibrationFile(null);
               }}
               disabled={isQuantizing}
             >
@@ -1657,11 +2168,146 @@ export const ModelSpace: React.FC<ModelSpaceProps> = ({ onOpenTraining }) => {
             <Button
               variant="primary"
               onClick={handleRunQuantize}
-              disabled={isQuantizing || !quantizeTarget}
+              disabled={isQuantizing || isUploadingCalibration || !quantizeTarget}
             >
-              {isQuantizing
+              {isUploadingCalibration
+                ? t('modelSpace.uploadingCalibration', '上传校准图片中...')
+                : isQuantizing
                 ? t('modelSpace.quantizing', '量化中...')
                 : t('modelSpace.startQuantize', '开始量化')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Project Association Modal */}
+      <Dialog open={showAssociateModal} onOpenChange={setShowAssociateModal}>
+        <DialogContent className="config-modal">
+          <DialogHeader className="config-modal-header">
+            <DialogTitle asChild>
+              <h3>{t('modelSpace.selectProject', '选择项目')}</h3>
+            </DialogTitle>
+            <DialogClose
+              className="close-btn"
+              onClick={() => {
+                setShowAssociateModal(false);
+                setSelectedModelForAssociate(null);
+              }}
+            >
+              <IoClose />
+            </DialogClose>
+          </DialogHeader>
+
+          <DialogBody className="config-modal-content">
+            {selectedModelForAssociate && (
+              <div style={{ marginBottom: '16px' }}>
+                <div style={{
+                  padding: '12px',
+                  background: 'var(--bg-secondary)',
+                  borderRadius: '6px',
+                  border: '1px solid var(--border-color)',
+                  fontSize: '14px'
+                }}>
+                  <strong>{t('modelSpace.modelToAssociate', '要关联的模型')}</strong>: {buildModelName(selectedModelForAssociate)}
+                </div>
+              </div>
+            )}
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))',
+              gap: '12px',
+              maxHeight: '400px',
+              overflowY: 'auto'
+            }}>
+              {isLoadingProjects ? (
+                <div style={{
+                  gridColumn: '1 / -1',
+                  textAlign: 'center',
+                  padding: '40px',
+                  color: 'var(--text-secondary)'
+                }}>
+                  {t('common.loading', '加载中...')}
+                </div>
+              ) : projects.length === 0 ? (
+                <div style={{
+                  gridColumn: '1 / -1',
+                  textAlign: 'center',
+                  padding: '40px',
+                  color: 'var(--text-secondary)'
+                }}>
+                  {t('modelSpace.noProjectsAvailable', '没有可用的项目')}
+                </div>
+              ) : (
+                projects.map((project) => (
+                  <div
+                    key={project.id}
+                    onClick={() => handleProjectSelect(project)}
+                    style={{
+                      padding: '16px',
+                      background: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px'
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = 'var(--primary-color)';
+                      e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.1)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = 'var(--border-color)';
+                      e.currentTarget.style.boxShadow = 'none';
+                    }}
+                  >
+                    <div style={{
+                      fontWeight: '600',
+                      fontSize: '15px',
+                      color: 'var(--text-primary)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap'
+                    }}>
+                      {project.name || project.id}
+                    </div>
+                    {project.description && (
+                      <div style={{
+                        fontSize: '13px',
+                        color: 'var(--text-secondary)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical'
+                      }}>
+                        {project.description}
+                      </div>
+                    )}
+                    <div style={{
+                      fontSize: '12px',
+                      color: 'var(--text-tertiary)',
+                      marginTop: 'auto'
+                    }}>
+                      ID: {project.id.slice(0, 8)}...
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </DialogBody>
+
+          <DialogFooter className="config-modal-actions">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowAssociateModal(false);
+                setSelectedModelForAssociate(null);
+              }}
+            >
+              {t('common.cancel', '取消')}
             </Button>
           </DialogFooter>
         </DialogContent>

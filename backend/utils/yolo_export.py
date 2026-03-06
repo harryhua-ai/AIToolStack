@@ -196,24 +196,26 @@ class YOLOExporter:
         # Export training set images and annotations
         train_copied = 0
         for image in train_images:
-            img_filename = Path(image['filename'])
-            img_stem = img_filename.stem
+            # Use actual physical filename from path (not original filename)
+            # This ensures the source and destination filenames match
+            actual_filename = Path(image['path']).name
+            img_stem = Path(actual_filename).stem
             img_width = image['width']
             img_height = image['height']
-            
-            # Copy image file
+
+            # Copy image file using actual filename
             src_path = datasets_root / project_data['id'] / image['path']
-            dst_path = images_train_dir / image['filename']
+            dst_path = images_train_dir / actual_filename
             shutil.copy2(src_path, dst_path)
             train_copied += 1
-            
+
             # Export annotations
             annotations = image.get('annotations', [])
             if annotations:
                 label_lines = YOLOExporter.export_image(
                     image['id'], annotations, class_map, img_width, img_height
                 )
-                
+
                 if label_lines:
                     label_file = labels_train_dir / f"{img_stem}.txt"
                     with open(label_file, 'w', encoding='utf-8') as f:
@@ -222,24 +224,26 @@ class YOLOExporter:
         # Export validation set images and annotations
         val_copied = 0
         for image in val_images:
-            img_filename = Path(image['filename'])
-            img_stem = img_filename.stem
+            # Use actual physical filename from path (not original filename)
+            # This ensures the source and destination filenames match
+            actual_filename = Path(image['path']).name
+            img_stem = Path(actual_filename).stem
             img_width = image['width']
             img_height = image['height']
-            
-            # Copy image file
+
+            # Copy image file using actual filename
             src_path = datasets_root / project_data['id'] / image['path']
-            dst_path = images_val_dir / image['filename']
+            dst_path = images_val_dir / actual_filename
             shutil.copy2(src_path, dst_path)
             val_copied += 1
-            
+
             # Export annotations
             annotations = image.get('annotations', [])
             if annotations:
                 label_lines = YOLOExporter.export_image(
                     image['id'], annotations, class_map, img_width, img_height
                 )
-                
+
                 if label_lines:
                     label_file = labels_val_dir / f"{img_stem}.txt"
                     with open(label_file, 'w', encoding='utf-8') as f:

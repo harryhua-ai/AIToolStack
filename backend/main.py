@@ -42,6 +42,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add global exception handler to ensure all errors return JSON
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler to ensure all errors return JSON format"""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+    )
+
 # Add request logging middleware
 @app.middleware("http")
 async def log_requests(request, call_next):
@@ -128,18 +140,42 @@ if FRONTEND_BUILD_DIR.exists():
 async def startup_event():
     """Initialize on application startup"""
     print("[Server] Starting CamThink AI Tool Stack backend...")
-    
+
     # Initialize database
     init_db()
     print("[Server] Database initialized")
-    
-    # Initialize NE301 project (auto-download if not exists)
+
+    # Initialize NE301 project (auto-download and update if needed)
     try:
         from backend.utils.ne301_init import ensure_ne301_project
+        from backend.utils.ne301_update import ensure_ne301_updated
+
+        # Step 1: Ensure project exists
         ne301_path = ensure_ne301_project()
+
+        # Step 2: Check for updates (if enabled)
+        if settings.NE301_AUTO_UPDATE:
+            print("[Server] Checking for NE301 updates...")
+            ne301_path, update_result = ensure_ne301_updated(
+                ne301_path=ne301_path,
+                timeout=settings.NE301_UPDATE_TIMEOUT
+            )
+
+            if update_result.success:
+                if update_result.action == "updated":
+                    print(f"[Server] NE301 updated: {update_result.old_commit[:8]} -> {update_result.new_commit[:8]}")
+                elif update_result.action == "already_latest":
+                    print("[Server] NE301 is already up to date")
+                elif update_result.action == "skipped":
+                    print(f"[Server] NE301 update skipped: {update_result.message}")
+            else:
+                print(f"[Server] NE301 update failed: {update_result.error}")
+                print("[Server] Continuing with existing version...")
+
         # Update environment variable for subsequent code
         os.environ["NE301_PROJECT_PATH"] = str(ne301_path)
-        print(f"[Server] NE301 project initialized at: {ne301_path}")
+        print(f"[Server] NE301 project ready at: {ne301_path}")
+
     except Exception as e:
         print(f"[Server] Failed to initialize NE301 project: {e}")
         print("[Server] NE301 model compilation may not work. Continuing...")
